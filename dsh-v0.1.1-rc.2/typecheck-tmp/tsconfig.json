@@ -1,0 +1,594 @@
+{
+  "extends": "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "composite": false,
+    "incremental": false,
+    "strict": false,
+    "noImplicitAny": false,
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "exactOptionalPropertyTypes": false,
+    "noUncheckedIndexedAccess": false,
+    "noImplicitOverride": false,
+    "noFallthroughCasesInSwitch": false,
+    "skipLibCheck": true,
+    "jsx": "react-jsx",
+    "lib": [
+      "ES2024",
+      "DOM"
+    ],
+    "types": [
+      "node",
+      "react"
+    ],
+    "typeRoots": [
+      "D:/AI/默认工作流/dsh-plugins/dsh-c/node_modules/@types"
+    ],
+    "paths": {
+      "@deepseek-ai/cordis": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./vendor/cordis/src"
+      ],
+      "@deepseek-ai/cosmokit": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./vendor/cosmokit/src"
+      ],
+      "@deepseek-ai/schemastery": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./vendor/schemastery/src"
+      ],
+      "@deepseek-ai/cordis-plugin-loader": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./vendor/loader/src"
+      ],
+      "@deepseek-ai/cordis-plugin-include": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./vendor/include/src"
+      ],
+      "@deepseek-ai/cordis-plugin-group": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./vendor/group/src"
+      ],
+      "@deepseek-ai/cordis-plugin-timer": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./vendor/timer/src"
+      ],
+      "@deepseek-ai/cordis-plugin-hmr": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./vendor/hmr/src"
+      ],
+      "@deepseek-ai/cordis-plugin-logger-console": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./vendor/logger-console/src"
+      ],
+      "@deepseek-ai/node-addon-landlock-run": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./native/landlock-run/packages/entry/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-invariants": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/runtime-diagnostics/invariants/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-tool-call-timeout-policy": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/guard/timeout-policy/src"
+      ],
+      "@deepseek-ai/dsh-tool-call-timeout-policy/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/guard/timeout-policy/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-typert-registry": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/typert/registry/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-typert-registry/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/typert/registry/src/client/index.ts"
+      ],
+      "@deepseek-ai/dsh-api-gateway": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/api/gateway/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-api-gateway/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/api/gateway/src/client/index.ts"
+      ],
+      "@deepseek-ai/dsh-api-gateway/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/api/gateway/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-api-gateway/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/api/gateway/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-typert-protocol": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/typert/protocol/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-typert-protocol/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/typert/protocol/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-typert-loader": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/typert/loader/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-session/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/session/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-typert-registry/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/typert/registry/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-typert-generator": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/typert/generator/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-attachment/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/attachment/attachment/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-session/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/session/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-session/surface": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/session/src/surface.ts"
+      ],
+      "@deepseek-ai/dsh-session-projection/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/session/session-projection/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-tool-todo/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/todo/tool-todo/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-tool-todo/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/todo/tool-todo/src/client.ts"
+      ],
+      "@deepseek-ai/dsh-session-title/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/session/session-title/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-session-title/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/session/session-title/src/client.ts"
+      ],
+      "@deepseek-ai/dsh-session-stats/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/session/session-stats/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-session-stats/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/session/session-stats/src/client.ts"
+      ],
+      "@deepseek-ai/dsh-plan-mode/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/plan/plan-mode/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-plan-mode/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/plan/plan-mode/src/client.ts"
+      ],
+      "@deepseek-ai/dsh-agent-presets/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/preset/agent-presets/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-pwsh-local": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/shell/pwsh-local/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-tool-pwsh": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/shell/tool-pwsh/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-shell-env": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/shell/shell-env/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-cordis-host-runner": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/cordis-host-runner/src/index.ts"
+      ],
+      "@deepseek-ai/dsh-cordis-host-runner/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/cordis-host-runner/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-goal/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/goal/goal/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-goal/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/goal/goal/src/client.ts"
+      ],
+      "@deepseek-ai/dsh-llm/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/llm/llm/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-llm/brand": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/llm/llm/src/brand.ts"
+      ],
+      "@deepseek-ai/dsh-llm-retry/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/llm/llm-retry/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-workflow/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/workflow/workflow/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-tool-workflow/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/workflow/tool-workflow/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-llm/message": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/llm/llm/src/message.ts"
+      ],
+      "@deepseek-ai/dsh-commands/brand": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/interaction/commands/src/brand.ts"
+      ],
+      "@deepseek-ai/dsh-commands/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/interaction/commands/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-jobs/brand": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/jobs/jobs/src/brand.ts"
+      ],
+      "@deepseek-ai/dsh-credentials/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/credentials/credentials/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-authorization/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/credentials/authorization/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-settings/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/settings/settings/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-api-remotes/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/api/remotes/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-api-remotes/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/api/remotes/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-compaction/checkpoint": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/compaction/compaction/src/checkpoint.ts"
+      ],
+      "@deepseek-ai/dsh-compaction/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/compaction/compaction/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-file-reference/grammar": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/context/file-reference/src/grammar.ts"
+      ],
+      "@deepseek-ai/dsh-file-reference/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/context/file-reference/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-session-reference/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/context/session-reference/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-tools/presentation": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/tools/src/presentation.ts"
+      ],
+      "@deepseek-ai/dsh-tools/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/tools/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-tool-subagent-control/list-agents": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/subagent/tool-subagent-control/src/list-agents.ts"
+      ],
+      "@deepseek-ai/dsh-user-approval/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/interaction/user-approval/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-user-questions/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/interaction/user-questions/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-agent/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/agent/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-agent/brand": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/agent/src/brand.ts"
+      ],
+      "@deepseek-ai/dsh-agent/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/agent/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-scope/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/scope/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-agent-loop/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/agent-loop/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-experimental-agent-team/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/experimental/agent-team/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-experimental-tool-agent-team/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/experimental/tool-agent-team/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-*/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/prompt/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/llm/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/shell/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/subprocess/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/e2b/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/code-runtime/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/fs/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/skill/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/compaction/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/context/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/goal/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/feedback/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/schedule/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/guard/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/plan/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/preset/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/subagent/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/jobs/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/experimental/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/workflow/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/web/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/attachment/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/spill/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/todo/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/bundle/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/sandbox/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/hooks/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/session/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/session-query/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/settings/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/credentials/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/acp/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/storage/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/workspace/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/sdk/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/interaction/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/boot/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/examples/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/util/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/mcp/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/identity/*/src/invariant.ts",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/test-support/*/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-host-*/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/*/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-client-*/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/*/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-headless/startup": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/bundle/headless/src/startup.ts"
+      ],
+      "@deepseek-ai/dsh-web-app/startup": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/bundle/web-app/src/startup.ts"
+      ],
+      "@deepseek-ai/dsh-client-*/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/*/src/client"
+      ],
+      "@deepseek-ai/dsh-host-apiproxy": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/apiproxy/src"
+      ],
+      "@deepseek-ai/dsh-host-directory-picker": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/directory-picker/src"
+      ],
+      "@deepseek-ai/dsh-host-directory-picker/*": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/directory-picker/src/*"
+      ],
+      "@deepseek-ai/dsh-host-directory-picker-browse": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/directory-picker-browse/src"
+      ],
+      "@deepseek-ai/dsh-host-directory-picker-browse/*": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/directory-picker-browse/src/*"
+      ],
+      "@deepseek-ai/dsh-host-directory-picker-native": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/directory-picker-native/src"
+      ],
+      "@deepseek-ai/dsh-host-directory-picker-native/*": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/directory-picker-native/src/*"
+      ],
+      "@deepseek-ai/dsh-host-directory-picker-auto": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/directory-picker-auto/src"
+      ],
+      "@deepseek-ai/dsh-host-directory-picker-auto/*": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/directory-picker-auto/src/*"
+      ],
+      "@deepseek-ai/dsh-host-apiproxy/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/apiproxy/src/fetch/client.ts"
+      ],
+      "@deepseek-ai/dsh-host-apiproxy/*": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/apiproxy/src/*"
+      ],
+      "@deepseek-ai/dsh-host-webserver": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/webserver/src"
+      ],
+      "@deepseek-ai/dsh-host-frontend-static": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/frontend-static/src"
+      ],
+      "@deepseek-ai/dsh-host-plugin-inventory": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/plugin-inventory/src"
+      ],
+      "@deepseek-ai/dsh-host-plugin-inventory/types": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/plugin-inventory/src/types.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-attachment": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-attachment/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-primitives": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-primitives/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-renderer": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-renderer/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-renderer/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-renderer/src/client"
+      ],
+      "@deepseek-ai/dsh-client-ui-renderer/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-renderer/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-client-connection": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/connection/src"
+      ],
+      "@deepseek-ai/dsh-api-remotes": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/api/remotes/src"
+      ],
+      "@deepseek-ai/dsh-api-remotes/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/api/remotes/src/client/index.ts"
+      ],
+      "@deepseek-ai/dsh-client-hmr": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/hmr/src"
+      ],
+      "@deepseek-ai/dsh-client-modules": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/modules/src"
+      ],
+      "@deepseek-ai/dsh-client-runtime": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/runtime/src"
+      ],
+      "@deepseek-ai/dsh-client-runtime/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/runtime/src/client"
+      ],
+      "@deepseek-ai/dsh-cordis-client-runner": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/cordis-client-runner/src"
+      ],
+      "@deepseek-ai/dsh-cordis-client-runner/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/cordis-client-runner/src/client"
+      ],
+      "@deepseek-ai/dsh-cordis-client-runner/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/cordis-client-runner/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-cordis": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/ui-cordis/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-cordis/client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/ui-cordis/src/client"
+      ],
+      "@deepseek-ai/dsh-client-ui-cordis/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/ui-cordis/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-client-test-runtime": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/test-support/client-runtime/src"
+      ],
+      "@deepseek-ai/dsh-client-test-runtime/invariant": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/test-support/client-runtime/src/invariant.ts"
+      ],
+      "@deepseek-ai/dsh-client-ui-layout": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-layout/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-sidebar": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-sidebar/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-brand-official": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-brand-official/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-conversation": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-conversation/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-tool": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-tool/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-deliverables": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-deliverables/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-workflow-run": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-workflow-run/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-input-trigger": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-input-trigger/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-reference": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-reference/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-commands": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-commands/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-model-selection": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-model-selection/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-goal": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-goal/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-message-feedback": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-message-feedback/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-agent-preset": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-agent-preset/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-permission-presets": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-permission-presets/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-skill": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-skill/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-subagent": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-subagent/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-plugins": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-settings-plugins/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-jobs": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-jobs/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-plan": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-plan/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-user-questions": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-user-questions/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-trajectory": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-trajectory/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-workspace": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-workspace/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-theme": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-theme/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-settings/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-general": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-settings-general/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-models": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-settings-models/src"
+      ],
+      "@deepseek-ai/dsh-client-ui-settings-plugin-inventory": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/ui-settings-plugin-inventory/src"
+      ],
+      "@deepseek-ai/dsh-client-locale": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/locale/src"
+      ],
+      "@deepseek-ai/dsh-client-web": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/web/src"
+      ],
+      "@deepseek-ai/dsh-sdk-client": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/sdk/client/src"
+      ],
+      "@deepseek-ai/dsh-sdk-protocol": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/sdk/protocol/src"
+      ],
+      "@deepseek-ai/dsh-sdk-jsonrpc-server": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/sdk/server/src"
+      ],
+      "@deepseek-ai/dsh-experimental-agent-team": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/experimental/agent-team/src"
+      ],
+      "@deepseek-ai/dsh-experimental-tool-agent-team": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/experimental/tool-agent-team/src"
+      ],
+      "@deepseek-ai/dsh-*": [
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/core/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/prompt/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/llm/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/shell/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/terminal/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/subprocess/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/e2b/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/code-runtime/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/fs/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/lsp/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/skill/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/compaction/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/context/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/goal/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/feedback/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/schedule/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/guard/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/plan/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/preset/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/subagent/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/jobs/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/experimental/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/workflow/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/web/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/attachment/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/spill/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/todo/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/bundle/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/extensions/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/sandbox/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/hooks/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/session/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/session-query/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/settings/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/credentials/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/acp/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/storage/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/workspace/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/sdk/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/interaction/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/boot/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/examples/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/util/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/mcp/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/identity/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/test-support/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/host/*/src",
+        "../../../dsh-official/deepseek-harness-v0.1.1-rc.2/./packages/client/*/src"
+      ],
+      "react": [
+        "D:/AI/默认工作流/dsh-plugins/dsh-c/node_modules/@types/react"
+      ],
+      "react/jsx-runtime": [
+        "D:/AI/默认工作流/dsh-plugins/dsh-c/node_modules/@types/react/jsx-runtime.d.ts"
+      ],
+      "@standard-schema/spec": [
+        "../../node_modules/.pnpm/@standard-schema+spec@1.1.0/node_modules/@standard-schema/spec"
+      ]
+    }
+  },
+  "include": [
+    "../plugin/src/index.ts",
+    "../plugin/src/host.ts",
+    "../plugin/src/shims.d.ts"
+  ]
+}

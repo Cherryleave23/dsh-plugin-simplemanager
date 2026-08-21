@@ -1,0 +1,19 @@
+# 依赖
+node_modules/
+**/node_modules/
+.pnpm-store/
+
+# 构建产物
+lib/
+dist/
+
+# 版本适配断点状态（git 走源码）
+_adapt_work/
+
+# 类型检查临时环境（依赖指向共享 store，不随源码分发）
+typecheck-tmp/node_modules/
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+*.log
