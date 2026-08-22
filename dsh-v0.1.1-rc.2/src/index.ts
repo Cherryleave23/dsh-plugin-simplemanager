@@ -21,6 +21,7 @@ import {
   type PluginBundle,
   type PluginScope,
   effectiveFolder,
+  isOfficialSystemDep,
 } from './host.js'
 import { pnpmAdd, pnpmRemove, specPackageName, verifyInstalled } from './pnpm.js'
 
@@ -1125,12 +1126,6 @@ async function promote(ctx: Context, host: SimpleManagerHost, name: string, runI
   markStep(run, 'finish', 'ok', packageName)
   finishRun(run)
   return { packageName, assembled, runId }
-}
-
-/** 官方系统依赖判定：桌面壳发行内嵌提供，任何情况都不许当作第三方闭包在卸载时 pnpm remove（P-042 兜底）。
- * 仅保护明确的内嵌官方包（@deepseek-ai/dsh-*、cordis、schemastery），不把 @deepseek-ai scope 下的第三方一刀切。 */
-function isOfficialSystemDep(name: string): boolean {
-  return name === '@deepseek-ai/cordis' || name === 'schemastery' || name.startsWith('@deepseek-ai/dsh-')
 }
 
 /**

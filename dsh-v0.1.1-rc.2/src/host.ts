@@ -415,6 +415,18 @@ export function isOfficialName(name: string): boolean {
   return name.startsWith('@deepseek-ai/') && !isShellName(name)
 }
 
+/** 官方系统依赖判定：桌面壳发行内嵌提供，任何情况都不许当作第三方闭包装入/卸载（P-042/P-045）。
+ * 仅认可明确的内嵌官方包（@deepseek-ai/dsh-*、@deepseek-ai/cordis、@deepseek-ai/schemastery、schemastery），
+ * 不把 @deepseek-ai scope 下的第三方一刀切。 */
+export function isOfficialSystemDep(name: string): boolean {
+  return (
+    name === '@deepseek-ai/cordis' ||
+    name === 'schemastery' ||
+    name === '@deepseek-ai/schemastery' ||
+    name.startsWith('@deepseek-ai/dsh-')
+  )
+}
+
 /** 桌面壳/客户端运行时产物识别：这些归"壳/third"，不算官方内核插件。启发式名单，可被 scopeOverrides 覆盖。 */
 export function isShellName(name: string): boolean {
   if (!name.startsWith('@deepseek-ai/')) return false

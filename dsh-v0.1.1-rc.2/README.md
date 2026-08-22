@@ -176,8 +176,9 @@ pnpm build       # tsc 编译 host 到 lib/ + tsdown 打包 client 到 lib/clien
 
 - **启停**：写 profile 层 `cordis.patch.yml` 的 `insert:` 数组（原子写、写前备份），并对运行 entry `loader.update({ disabled })` 立即热生效。
 - **临时加载**：根 `Loader.create()` 挂到根树；根 Loader 的 `write()` 为 no-op，既不写 patch 也不落盘，进程退出即随堆释放 → 零残留。
-- **转正**：冲突检测以装配表（bundles + patch）为真值判「是否已持久安装」，不把物理命中误判为热装对象自身；`pnpmAdd` 跳过官方业务 peer（官方 `@deepseek-ai/dsh-*` 由发行内嵌提供），避免卸载误删官方核心依赖。
-- **卸载**：对确认真卸载的第三方包物理目录 `rmSync` 强删兜底（pnpm 未登记的孤儿目录也可清），残留七位点（deps / bundles / patch / cordis.yml / node_modules / .pnpm / lock）全清才算干净。
+- **转正**：冲突检测以装配表（bundles + patch）为真值判「是否已持久安装」，不把物理命中误判为热装对象自身；`pnpmAdd` 跳过**官方系统依赖**（官方 `@deepseek-ai/dsh-*`、`@deepseek-ai/cordis`、`@deepseek-ai/schemastery` 由发行内嵌提供），避免卸载误删官方核心依赖，也让热装/转正不把官方包落进 profile（P-042/P-045）。
+- **卸载**：对确认真卸载的第三方包物理目录 `rmSync` 强删兜底（pnpm 未登记的孤儿目录也可清），残留七位点（deps / bundles / patch / cordis.yml / node_modules / .pnpm / lock）全清才算干净（P-043）。
+- **唯一官方白名单**：官方系统依赖判定集中在 host.ts `isOfficialSystemDep` 一处真源，pnpm.ts（闭包过滤）与 index.ts（卸载保护）统一复用，杜绝各处各自维护白名单漂移（P-045）。
 
 ---
 
@@ -218,6 +219,8 @@ pnpm build       # tsc 编译 host 到 lib/ + tsdown 打包 client 到 lib/clien
 - [x] 转正持久装配：转正后写入 profile 层装配登记，重启后真正持久加载
 - [x] 转正冲突判定纠偏：以装配表（bundles + patch）为真值判「已持久安装」，弃物理命中误判（P-041）
 - [x] 转正跳过官方业务 peer：官方 `@deepseek-ai/dsh-*` 由发行内嵌提供，不装进 profile、不回收入闭包（P-042）
+- [x] 官方系统依赖统一白名单：`isOfficialSystemDep`（含 `@deepseek-ai/cordis`、`@deepseek-ai/schemastery`）集中真源，热装/转正/卸载全链路复用，官方包不进 profile（P-045）
+- [x] profile 收敛：清除 `dsh-plugins` 聚合残留与本地 `@deepseek-ai/cordis`，deps 仅留真身；验证 peer cordis 由发行内嵌 resolve（P-046）
 - [x] 重载界面：一键重载 CLIENT 层，让热加载插件 client 卡片显现（无需整壳重启）
 - [x] 卸载完整清除：移除磁盘包（含孤儿目录强删）+ 依赖闭包 + 装配登记 + 自持数据
 

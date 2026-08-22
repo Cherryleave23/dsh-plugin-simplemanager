@@ -14,6 +14,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, readFileSync, readdirSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
+import { isOfficialSystemDep } from './host.js'
 
 export type PluginSpecKind = 'file' | 'registry'
 
@@ -529,12 +530,13 @@ export async function pnpmAdd(profileDir: string, spec: string, options: { timeo
   // 链接插件的 registry 闭包：成功补装后返回名字供回滚/卸载回收；补装失败则尽力清理已装闭包，避免半装状态。
   const applyClosure = async (dir: string): Promise<PnpmOutcome | null> => {
     const { specs, names } = closureSpecs(dir)
-    // 热装跳过官方业务 peer：官方 @deepseek-ai/dsh-* 由桌面壳发行内嵌提供，不装进 profile，
-    // 让 overlay 回落选 install 来源以规避动态热装二次解析限制（P-033）。从闭包中剔除并同步缩容 installedDeps。
+    // 热装跳过官方系统依赖：官方 DSH 内嵌包（@deepseek-ai/cordis、全部 @deepseek-ai/dsh-*、schemastery）由发行
+    // 进程内嵌提供，不装进 profile——装进反而触发 overlay 二次解析限制且增慢装卸（P-033、P-045）。从闭包中剔除
+    // 并同步缩容 installedDeps。
     const filteredIds = options.skipOfficialPeers
-      ? new Set(names.filter((n) => n.startsWith('@deepseek-ai/dsh-')))
+      ? new Set(names.filter((n) => isOfficialSystemDep(n)))
       : new Set<string>()
-    const specs_ = filteredIds.size ? specs.filter((s, i) => !(filteredIds.has(names[i]) && names[i].startsWith('@deepseek-ai/dsh-'))) : specs
+    const specs_ = filteredIds.size ? specs.filter((s, i) => !(filteredIds.has(names[i]) && isOfficialSystemDep(names[i]))) : specs
     const names_ = filteredIds.size ? names.filter((n) => !filteredIds.has(n)) : names
     if (specs_.length === 0) return { ok: true, code: 0, message: '依赖安装成功（仅保留非官方依赖，官方业务 peer 由发行内嵌提供）', installedDeps: names_ }
     const closure = await runPnpm(profileDir, ['add', ...specs_, '--reporter=ndjson'], timeoutMs)
