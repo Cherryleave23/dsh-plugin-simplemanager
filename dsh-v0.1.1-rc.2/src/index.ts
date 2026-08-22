@@ -12,7 +12,7 @@
  */
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync, readFileSync, rmSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import {
@@ -39,7 +39,8 @@ interface LoaderService {
   remove(id: string): Promise<void>
   /** 差异化热更新入口：改 disabled 走 dispose/重建，改 config 走原地热更新。 */
   update(id: string, options: { disabled?: boolean; name?: string; config?: Record<string, unknown> }): Promise<void>
-  /** 按 entryId 反查 entry 节点（读 fiber 状态供观测）。 */
+  /** 按 entryId 反查 entry 节点（读 fiber 状态供观测）。create 的 promise 已 await 装配/apply（apply 失败即 reject，
+   * 根因在 error.cause 链），故此处仅用于成功后的运行态观测，不做失败判定。 */
   resolve?(id: string): { fiber?: { state?: number } | null }
   entries(): Iterable<{ id?: string; options?: { name?: string; group?: boolean }; disabled?: boolean; fiber?: { state?: number } | null }>
 }
@@ -94,8 +95,11 @@ interface PluginView {
   state: FiberPhaseName
   /** 插件自身声明的依赖（name@range）；临时插件为本次补装的闭包依赖。点击卡片展开可见。 */
   dependencies: string[]
-  /** true = 运行时临时加载（不在已安装扫描目录里、由本面板 loader.create 注入），重启即消失。 */
-  temporary: boolean
+  /** 热插拔生命周期档位：temporary = 本会话临时加载（重启即消失）；promoted = 已转正、重启后变持久；null = 非热插拔（持久安装/官方/壳）。 */
+  hot: 'temporary' | 'promoted' | null
+  /** 本会话刚卸载、但装配/物理层可能仍在收敛（loader 未即时拆除或桌面壳复核写回），列表仍显示该条目时的
+   * 残留标记：UI 应标为「已卸载、不可启停」，重启后自然消失（P-039 卸载残留状态标记）。 */
+  residual: boolean
 }
 
 export function apply(ctx: AppContext): void {
@@ -137,30 +141,46 @@ export function apply(ctx: AppContext): void {
     const patchEnabled = host.readPatchEnabledIds()
     const live = loaderLiveMap(ctx)
 
-    // catalog（已安装）里每个 bundle 的视图
-    const plugins: PluginView[] = catalog.map((b) => ({
-      name: b.name,
-      version: b.version,
-      description: b.description,
-      scope: b.scope,
-      source: b.source,
-      enabled: enabledFor(b, patchEnabled, live),
-      toggleable: b.scope === 'third' || patchEnabled.has(b.name),
-      folder: effectiveFolder(b, overlay),
-      note: overlay.notes[b.name] ?? '',
-      alias: overlay.aliases[b.name] ?? '',
-      state: live.get(b.name)?.phase ?? null,
-      dependencies: b.dependencies,
-      temporary: false,
-    }))
+    // 热插拔档位判定优先于 catalog 渲染：无论该插件是否已出现在 catalog（promote 后它已物理装入
+    // 且 entry 仍运行在装配表，buildCatalog 会包含它），只要在 tempInfos / promotedPending 内就
+    // 单独标记档位，避免与持久安装混淆。
+    const hotLevel = (n: string): 'temporary' | 'promoted' | null => {
+      if (tempInfos.has(n)) return 'temporary'
+      if (promotedPending.has(n)) return 'promoted'
+      return null
+    }
 
-    // 仅本面板会话里 tempLoad 临时 create 过、且不在已安装扫描目录中的 entry
-    // → 运行时临时插件（重启即消失）。已装未装配 / cordis: 内置不算临时，不展示为临时。
+    // catalog（已安装）里每个 bundle 的视图
+    const plugins: PluginView[] = catalog.map((b) => {
+      const hot = hotLevel(b.name)
+      const residual = recentlyUninstalled.has(b.name)
+      return {
+        name: b.name,
+        version: b.version,
+        description: b.description,
+        scope: b.scope,
+        source: hot ? 'temp' : b.source,
+        enabled: residual ? false : enabledFor(b, patchEnabled, live),
+        toggleable: residual ? false : b.scope === 'third' || patchEnabled.has(b.name),
+        folder: effectiveFolder(b, overlay),
+        note: overlay.notes[b.name] ?? '',
+        alias: overlay.aliases[b.name] ?? '',
+        state: live.get(b.name)?.phase ?? null,
+        dependencies: b.dependencies,
+        hot: residual ? null : hot,
+        residual,
+      }
+    })
+
+    // 仅 live、不在已安装扫描目录中的临时 entry → 运行时临时插件（重启即消失）。
+    // 已在 catalog 渲染的同名项（含 hot 档位），此处跳过避免重复。
     const catalogNames = new Set(plugins.map((p) => p.name))
     for (const [name, { enabled, phase }] of live) {
       if (name.startsWith('cordis:') || name === '@deepseek-ai/cordis-plugin-loader') continue
+      const hot = hotLevel(name)
+      if (!hot) continue
       if (catalogNames.has(name)) continue
-      if (!tempInfos.has(name)) continue
+      const info = tempInfos.get(name)
       plugins.push({
         name,
         version: '',
@@ -173,8 +193,9 @@ export function apply(ctx: AppContext): void {
         note: '',
         alias: '',
         state: phase,
-        dependencies: tempInfos.get(name)?.installedDeps ?? [],
-        temporary: true,
+        dependencies: info?.installedDeps ?? [],
+        hot,
+        residual: false,
       })
     }
 
@@ -743,6 +764,11 @@ function enabledFor(b: PluginBundle, patchEnabled: Set<string>, live: Map<string
 /** 临时闭包：resolve 名 → { entryId, spec（pnpm add 用原始 spec）, installedDeps（本次补装闭包依赖） }。
  * 临时插件随进程消亡、不写 patch，无需落盘；转正（promote）才写 patch 持久化。 */
 const tempInfos = new Map<string, { entryId: string; spec: string; installedDeps: string[] }>()
+/** 已转正待重启的插件（本次进程 entry 仍运行至退出；重启后由 patch 装配为持久）。会话级内存，重启即空。 */
+const promotedPending = new Set<string>()
+/** 本会话成功卸载、但装配/物理层可能仍在收敛（loader 未即时拆除 / 桌面壳复核写回）而仍残留在列表的包名。
+ * 装配层收敛以重启为判定（P-039），此集用于 buildView 把这类残留正确标记为「已卸载、不可启停」，而非正常可装可启停插件。 */
+const recentlyUninstalled = new Set<string>()
 
 /** —— 步骤引擎（热插拔操作的过程追踪）——
  * 以「预定义步骤计划 + 每个步骤独立状态」的方式输出操作进度，供前端：
@@ -924,7 +950,15 @@ async function tempLoad(
     entryId = await ctx.loader.create({ name: packageName, config: {}, disabled: false })
     markStep(run, 'assemble', 'ok')
   } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error)
+    // 官方 loader 对 apply/import 错会用 { cause } 包装（failed to apply loader entry <id> (<name>): …），
+    // 剥 cause 链取最底层 message 才是插件自身的根因；两者不同时并列保留 loader 上下文便于定位。
+    let root: unknown = error
+    while (root instanceof Error && root.cause) root = root.cause
+    const detail = root instanceof Error ? root.message : String(root)
+    const context = error instanceof Error && error.message && error.message !== detail
+      ? `；loader 上下文：${error.message}`
+      : ''
+    const reason = detail + context
     const installNote = depsApplied
       ? ''
       : `（前置依赖/包安装未成功：${pnpmReason ?? '包未装入 profile'}，故无法被 loader 解析装配）`
@@ -933,7 +967,7 @@ async function tempLoad(
       if (host?.profileDir) nodeModulesHit = String(existsSync(join(host.profileDir, 'node_modules', packageName)))
     } catch { /* 探测失败即 ? */ }
     markStep(run, 'assemble', 'err', reason)
-    console.log(`[dsh-simplemanager] tempLoad 热装失败 profileDir=${host?.profileDir} depsApplied=${depsApplied} nodeModulesHit=${nodeModulesHit} spec=${name}`)
+    console.log(`[dsh-simplemanager] tempLoad 热装失败 profileDir=${host?.profileDir} depsApplied=${depsApplied} nodeModulesHit=${nodeModulesHit} spec=${name} rootCause=${detail}`)
     const officialNote = officialPeers && officialPeers.length > 0
       ? '. 注意：该插件依赖官方业务包 ' + officialPeers.join('/') + '，桌面壳对动态热装的官方 peer 解析有限制，建议改用官方渠道安装后再用。'
       : ''
@@ -994,11 +1028,26 @@ async function tempRemove(ctx: AppContext, host: SimpleManagerHost | null, name:
   host?.forgetHotInstall(name)
 
   markStep(run, 'deps', 'running')
-  if (host && host.profileDir && info.installedDeps.length > 0) {
-    for (const dep of info.installedDeps) {
-      const neededByOther = [...tempInfos.values()].some((o) => o.installedDeps.includes(dep))
-      if (neededByOther) continue
-      await pnpmRemove(host.profileDir, dep).catch(() => { /* 回收尽力而为，失败不阻断卸载 */ })
+  if (host && host.profileDir) {
+    // 主包物理：临时卸载即回收，装卸对称（与 promote/uninstall 移除装配登记后回收文件一致）。
+    // 仅当仍被其他活跃临时插件或持久装配间接依赖其包名时才保留。P-041 同根：物理随装配状态进退，
+    // 不再把「node_modules 里有该包」误当持久装配遗留为幽灵条目。
+    const packageName = specPackageName(info.spec) ?? name
+    const stillNeeded = new Set<string>()
+    for (const [, o] of tempInfos) for (const d of o.installedDeps) stillNeeded.add(specPackageName(d) ?? d)
+    for (const b of buildCatalog(ctx, host)) {
+      if (b.name === packageName) continue
+      for (const d of b.dependencies) stillNeeded.add(specPackageName(d) ?? d)
+    }
+    if (!stillNeeded.has(packageName)) {
+      await pnpmRemove(host.profileDir, packageName).catch(() => { /* 回收尽力而为，失败不阻断卸载 */ })
+    }
+    if (info.installedDeps.length > 0) {
+      for (const dep of info.installedDeps) {
+        const neededByOther = [...tempInfos.values()].some((o) => o.installedDeps.includes(dep))
+        if (neededByOther) continue
+        await pnpmRemove(host.profileDir, dep).catch(() => { /* 回收尽力而为，失败不阻断卸载 */ })
+      }
     }
   }
   markStep(run, 'deps', 'ok')
@@ -1023,8 +1072,22 @@ async function promote(ctx: Context, host: SimpleManagerHost, name: string, runI
   if (!info) { fail(`「${name}」不是本面板临时加载的插件，无法转正`); throw new Error(`「${name}」不是本面板临时加载的插件，无法转正`) }
   const packageName = specPackageName(info.spec) ?? name
 
+  // 冲突检测（判据6：不重复物理安装、不覆盖已持久装配）。同名「已持久装配」存在 → 阻止转正，避免覆盖已装文件/装配冲突。
+  // 注意：热装(tempLoad) 会真实把包链进 profile node_modules，因此 scanCatalog() 必定能扫到本包——而它正是本次要转正的
+  // 对象自身的物理文件，不代表「已持久安装」。真正代表持久装配的是 bundles 装配清单 + patch 启用层（P-041 误判修复）。
   markStep(run, 'deps', 'running')
-  const outcome = await pnpmAdd(host.profileDir, info.spec)
+  const persistent =
+    host.readBundles().has(packageName) ||
+    host.readPatchEnabledIds().has(packageName)
+  if (persistent) {
+    markStep(run, 'deps', 'err', `「${packageName}」已是持久安装，无需转正`)
+    fail(`「${packageName}」已是持久安装的插件，不能转正（避免与已装文件/装配冲突）`)
+    throw new Error(`「${packageName}」已是持久安装的插件，不能转正`)
+  }
+  // 与 tempLoad 一致跳过官方业务 peer：官方 @deepseek-ai/dsh-* 由桌面壳发行内嵌提供，
+  // 不装进 profile、也不记入 closureDeps——否则卸载时会把官方核心依赖当可回收闭包逐个
+  // pnpm remove，破坏基础功能（P-042，promote 曾漏传 skipOfficialPeers）。
+  const outcome = await pnpmAdd(host.profileDir, info.spec, { skipOfficialPeers: true })
   if (!outcome.ok) {
     // 闭包补装失败时 pnpmAdd 已尽力回收闭包；此处把已链接的插件本身也回收，转正失败不残留。
     await pnpmRemove(host.profileDir, packageName).catch(() => {})
@@ -1053,13 +1116,21 @@ async function promote(ctx: Context, host: SimpleManagerHost, name: string, runI
   host.setClosureDeps(packageName, outcome.installedDeps ?? [])
   // 已转正为正式装配，不再算待清理的手热装残留。
   host.forgetHotInstall(packageName)
-  // 已持久化装配：从临时闭包移除，重启后由 patch 装配（本次进程内原临时 entry 仍运行至退出）。
+  // 已持久化装配：从临时闭包移除，改记为「已转正待重启」，重启后由 patch 装配为持久
+  // （本次进程内原临时 entry 仍运行至退出，UI 以 promoted 档位标记，避免与持久安装混淆）。
   tempInfos.delete(name)
+  promotedPending.add(packageName)
 
   markStep(run, 'finish', 'running')
   markStep(run, 'finish', 'ok', packageName)
   finishRun(run)
   return { packageName, assembled, runId }
+}
+
+/** 官方系统依赖判定：桌面壳发行内嵌提供，任何情况都不许当作第三方闭包在卸载时 pnpm remove（P-042 兜底）。
+ * 仅保护明确的内嵌官方包（@deepseek-ai/dsh-*、cordis、schemastery），不把 @deepseek-ai scope 下的第三方一刀切。 */
+function isOfficialSystemDep(name: string): boolean {
+  return name === '@deepseek-ai/cordis' || name === 'schemastery' || name.startsWith('@deepseek-ai/dsh-')
 }
 
 /**
@@ -1090,13 +1161,29 @@ async function uninstall(ctx: AppContext, host: SimpleManagerHost, name: string,
   host.setPatchEnabled(packageName, packageName, false)
   // 官方渠道登记清理：从 package.json 的 bundles 装配清单移除，避免重启解析已删包报错（P-033 顺带发现）。
   host.removeBundle(packageName)
+  // 官方 bundle 层装配清单（cordis.yml）清理：官方 `dsh plugin add` 的自装/第三方插件登记于此，卸载若不清，
+  // 重启后 loader 仍由该清单装配 entry → 插件残留在列表且仍可启停（P-039）。
+  host.removeBundleEntry(packageName)
   markStep(run, 'deregister', 'ok')
 
   // 1) 物理移除 + 依赖闭包按引用回收。
   markStep(run, 'remove', 'running')
-  const closure = host.getClosureDeps(packageName)
+  let closure = host.getClosureDeps(packageName)
+  if (closure.length === 0 && bundle.dependencies.length > 0) {
+    // 非管家记录来源（外部安装的第三方）：以其 manifest 声明的直接依赖作为回收候选，
+    // 交由下方「按引用保护」判定——仍在被其他插件/活跃临时插件/其他闭包使用则保留，仅回收独占闭包。
+    closure = bundle.dependencies.map((d) => specPackageName(d) ?? d).filter((x): x is string => x.length > 0)
+  }
   await pnpmRemove(host.profileDir, packageName)
   host.forgetHotInstall(packageName)
+  // 兜底物理清理：pnpm remove 只删它登记过的包；若该包在 profile node_modules 是 pnpm 不识别的
+  // 孤儿目录（pnpm-lock 无记录，历史 file: 真拷贝所致），pnpm 删不掉、重启后 scanCatalog 又会把它
+  // 扫回列表标成 source=profile。此处对确认卸载的第三方包物理目录强删，杜绝卸载后残留（P-043）。
+  const pkgPhysical = join(host.profileDir, 'node_modules', packageName)
+  if (existsSync(pkgPhysical)) {
+    // force:true 目录不存在时不抛错；递归删除该第三方包物理目录，pnpm 未识别的孤儿目录也能清掉。
+    rmSync(pkgPhysical, { recursive: true, force: true })
+  }
   if (closure.length > 0) {
     const stillNeeded = new Set<string>()
     const mark = (spec: string): void => {
@@ -1114,6 +1201,9 @@ async function uninstall(ctx: AppContext, host: SimpleManagerHost, name: string,
     }
     let removed = 0
     for (const dep of closure) {
+      // 官方系统依赖绝不回收（P-042 兜底）：即使 closureDeps 因历史脏数据/未来缺陷混入官方内嵌包，
+      // 也直接跳过，防止物理删除 + 清掉 profile 声明导致重启崩 (基础功能红线)。
+      if (isOfficialSystemDep(dep)) continue
       if (stillNeeded.has(dep)) continue
       await pnpmRemove(host.profileDir, dep).catch(() => { /* 回收尽力而为 */ })
       removed += 1
@@ -1132,6 +1222,12 @@ async function uninstall(ctx: AppContext, host: SimpleManagerHost, name: string,
   delete overlay.assignments[packageName]
   host.writeOverlay(overlay)
   markStep(run, 'data', 'ok')
+
+  // 卸载成功：清掉历史热插拔档位残留（promoted 的「待重启」徽标对该已卸载插件不再成立），
+  // 并记入本会话 recentlyUninstalled——若 loader 未能即时拆除 / 桌面壳复核写回导致列表仍显示该条目，
+  // buildView 会据此把残留正确标记为「已卸载、不可启停」，而非正常可装可启停插件（P-039）。
+  promotedPending.delete(packageName)
+  recentlyUninstalled.add(packageName)
 
   markStep(run, 'finish', 'running')
   markStep(run, 'finish', 'ok', packageName)

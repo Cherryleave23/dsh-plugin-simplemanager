@@ -320,6 +320,35 @@ export class SimpleManagerHost {
     return true
   }
 
+  /** 从 profile 的 bundle 层装配清单 `cordis.yml` 移除该插件的装配 entry（官方 `dsh plugin add`
+   * 登记的顶层序列项）。与 patch 层（cordis.patch.yml）/ package.json bundles 不同：官方 bundle 插件
+   * （含自装第三方）的启用装配登记在 `cordis.yml`——卸载若不清这层，重启后 loader 仍装配该 entry，
+   * buildCatalog 经 `assembledModuleNames` 继续收拢它，插件就会残留在列表且仍可启停（P-038/P-039）。
+   * `cordis.yml` 是规整的顶层数组（块起点为无缩进的 `- `，子字段 2 空格缩进），按块精确移除目标。返回是否发生实际变更。 */
+  removeBundleEntry(packageName: string): boolean {
+    const file = join(this.profileDir, 'cordis.yml')
+    if (!existsSync(file)) return false
+    const raw = readFileSync(file, 'utf8')
+    const lines = raw.split(/\r?\n/)
+    const escaped = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp(`^(?:-\\s+)?(?:id|name):\\s*['"]?${escaped}['"]?\\s*$`)
+    const starts: number[] = []
+    for (let i = 0; i < lines.length; i++) if (/^-\s/.test(lines[i])) starts.push(i)
+    for (let s = 0; s < starts.length; s++) {
+      const start = starts[s]
+      const end = s + 1 < starts.length ? starts[s + 1] : lines.length
+      const hit = lines.slice(start, end).some((l) => re.test(l.trim()))
+      if (!hit) continue
+      const eol = raw.includes('\r\n') ? '\r\n' : '\n'
+      let body = [...lines.slice(0, start), ...lines.slice(end)].join(eol)
+      if (!body.endsWith(eol)) body += eol
+      backup(file)
+      atomicWrite(file, body)
+      return true
+    }
+    return false
+  }
+
   /** 记录一次热装安装（tempLoad pnpmAdd 成功），供跨重启清理物理残留。 */
   pushHotInstall(packageName: string): void {
     const overlay = this.readOverlay()

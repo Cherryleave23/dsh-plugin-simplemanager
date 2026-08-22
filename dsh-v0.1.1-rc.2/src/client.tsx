@@ -44,8 +44,10 @@ interface Plugin {
   state: 'active' | 'failed' | 'pending' | 'loading' | 'disposed' | 'unloading' | null
   /** 插件自身声明的依赖（name@range）；临时插件为本次补装的闭包依赖。点击卡片展开可见。 */
   dependencies: string[]
-  /** true = 运行时临时加载，重启即消失。 */
-  temporary: boolean
+  /** 热插拔生命周期档位：temporary = 本会话临时加载（重启即消失）；promoted = 已转正、重启后变持久；null = 非热插拔（持久安装/官方/壳）。 */
+  hot: 'temporary' | 'promoted' | null
+  /** 本会话刚卸载、列表仍显示其收敛中条目的残留标记：应标为「已卸载、不可启停」，重启后自然消失。 */
+  residual?: boolean
 }
 
 interface Browse {
@@ -57,14 +59,27 @@ interface Browse {
 const API = '/simplemanager'
 
 /** —— 操作日志持久 store ——
- * 日志存在模块级（软件生命周期内持续），而非组件 state——这样退出/进入设置页、切换页签都不会清空，
- * 只有用户手动「清空」或 DSH 进程重启才会消失。组件通过 subscribe 订阅刷新。 */
+ * 日志存模块级 + sessionStorage 双层：模块级保证退出/进入设置页、切换页签不丢；
+ * 同步到 sessionStorage 保证点「重载界面」（window.location.reload 触发模块重求值）也不丢。
+ * 只有用户手动「清空」才消失。组件通过 subscribe 订阅刷新。 */
 interface LogEntry {
   time: string
   level: 'info' | 'ok' | 'warn' | 'err'
   text: string
 }
-const logStore: LogEntry[] = []
+const LOG_STORE_KEY = 'dsh-plugin-simplemanager.logs'
+/** 从 sessionStorage 恢复上次的日志（reload 后模块重求值也能接上）。 */
+function restoreLogStore(): LogEntry[] {
+  try {
+    const raw = window.sessionStorage.getItem(LOG_STORE_KEY)
+    if (!raw) return []
+    const parsed: unknown = JSON.parse(raw)
+    return Array.isArray(parsed) ? (parsed as LogEntry[]) : []
+  } catch {
+    return []
+  }
+}
+const logStore: LogEntry[] = restoreLogStore()
 /** 步骤骨架 + 实时状态：当前进行中的一次操作步骤（run），null = 无进行中/上次操作已结算。 */
 interface StepView {
   runId: string
@@ -225,6 +240,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     const time = `${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
     logStore.push({ time, level, text })
     if (logStore.length > 2000) logStore.splice(0, logStore.length - 2000)
+    try { window.sessionStorage.setItem(LOG_STORE_KEY, JSON.stringify(logStore)) } catch { /* storage 不可用时仅保留内存 */ }
     logSubscribe?.()
     setLogs(logStore.slice())
     requestAnimationFrame(() => logRef.current?.scrollTo({ top: logRef.current.scrollHeight }))
@@ -266,6 +282,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
 
   const clearLogs = (): void => {
     logStore.length = 0
+    try { window.sessionStorage.removeItem(LOG_STORE_KEY) } catch { /* 忽略 */ }
     stepView = null
     logSubscribe?.()
     setLogs([])
@@ -1124,8 +1141,14 @@ function PluginCard(p: CardProps): JSX.Element {
       <div style={s.cardHead} onClick={stop}>
         <span style={badgeStyle}>{scopeLabel}</span>
         <span style={s.headRight}>
-          {p.plugin.temporary && (
+          {p.plugin.hot === 'temporary' && (
             <span style={s.tempBadge} title="运行时临时加载，重启即消失">{'临时'}</span>
+          )}
+          {p.plugin.hot === 'promoted' && (
+            <span style={s.promotedBadge} title="已转正为持久安装，重启后装配生效">{'待重启'}</span>
+          )}
+          {p.plugin.residual && (
+            <span style={s.residualBadge} title="本会话已卸载，装配/物理层待重启收敛；不可再无谓启停">{'已卸载'}</span>
           )}
           <span style={stateStyle}>{stateInfo}</span>
           <label style={s.switchLabel} title={p.plugin.toggleable ? '点击启停' : '内置插件不可停用'}>
@@ -1134,11 +1157,14 @@ function PluginCard(p: CardProps): JSX.Element {
               <span style={{ ...s.knob, transform: p.plugin.enabled ? 'translateX(16px)' : 'translateX(0)' }} />
             </span>
           </label>
-          {p.plugin.temporary && (
+          {p.plugin.hot === 'temporary' && (
             <>
               <button style={s.promoteBtn} title="真注入：安装依赖并写入装配清单，重启后持久生效" onClick={p.onPromote}>{'转正'}</button>
               <button style={s.tempRemoveBtn} title="卸载临时插件（仅当前进程，不影响磁盘）" onClick={p.onTempRemove}>{'✕'}</button>
             </>
+          )}
+          {p.plugin.hot === 'promoted' && (
+            <span style={s.promotedHint} title="重启后由装配清单持久加载；当前进程内原临时 entry 仍运行至退出">{'重启后持久生效'}</span>
           )}
         </span>
       </div>
@@ -1247,7 +1273,7 @@ function PluginCard(p: CardProps): JSX.Element {
         )}
       </div>
 
-      {!p.plugin.temporary && p.plugin.scope === 'third' && p.plugin.toggleable && (
+      {p.plugin.hot !== 'temporary' && !p.plugin.residual && p.plugin.scope === 'third' && p.plugin.toggleable && (
         <div style={s.cardFooter}>
           <button style={s.uninstallBtn} title="真卸载：移出磁盘、注销装配并清理备注/分类" onClick={(e) => {
             stop(e)
@@ -1385,9 +1411,14 @@ const s: Record<string, CSSProperties> = {
     background: 'transparent',
     color: 'var(--dsw-alias-label-secondary)',
     borderRadius: 6,
-    padding: '3px 9px',
+    height: 28,
+    boxSizing: 'border-box',
+    padding: '0 12px',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
     cursor: 'pointer',
-    fontSize: 11,
+    fontSize: 12,
     flexShrink: 0,
   },
   logView: {
@@ -1532,7 +1563,12 @@ const s: Record<string, CSSProperties> = {
     background: 'var(--dsw-alias-state-business-primary)',
     color: '#fff',
     borderRadius: 6,
-    padding: '0 10px',
+    height: 28,
+    boxSizing: 'border-box',
+    padding: '0 14px',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
     cursor: 'pointer',
     fontSize: 12, fontWeight: 500,
     flexShrink: 0,
@@ -1624,7 +1660,12 @@ const s: Record<string, CSSProperties> = {
     background: 'transparent',
     color: 'var(--dsw-alias-label-secondary)',
     borderRadius: 6,
-    padding: '4px 10px',
+    height: 28,
+    boxSizing: 'border-box',
+    padding: '0 12px',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
     cursor: 'pointer',
     fontSize: 12,
     flexShrink: 0,
@@ -1634,7 +1675,12 @@ const s: Record<string, CSSProperties> = {
     background: 'var(--dsw-alias-bg-muted)',
     color: 'var(--dsw-alias-label-primary)',
     borderRadius: 6,
-    padding: '4px 10px',
+    height: 28,
+    boxSizing: 'border-box',
+    padding: '0 12px',
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
     cursor: 'pointer',
     fontSize: 12,
     flexShrink: 0,
@@ -1645,8 +1691,36 @@ const s: Record<string, CSSProperties> = {
     borderRadius: 5,
     fontSize: 11,
     fontWeight: 600,
+    color: 'var(--dsw-alias-state-business-primary)',
+    background: 'color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent)',
+    whiteSpace: 'nowrap',
+  },
+  promotedBadge: {
+    padding: '1px 6px',
+    borderRadius: 5,
+    fontSize: 11,
+    fontWeight: 600,
     color: 'var(--dsw-alias-state-warning-primary)',
     background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 14%, transparent)',
+    border: '1px dashed var(--dsw-alias-state-warning-primary)',
+    whiteSpace: 'nowrap',
+  },
+  residualBadge: {
+    padding: '1px 6px',
+    borderRadius: 5,
+    fontSize: 11,
+    fontWeight: 600,
+    color: 'var(--dsw-alias-label-tertiary)',
+    background: 'color-mix(in srgb, var(--dsw-alias-label-tertiary) 12%, transparent)',
+    border: '1px solid transparent',
+    textDecoration: 'line-through',
+    whiteSpace: 'nowrap',
+  },
+  promotedHint: {
+    fontSize: 11,
+    fontWeight: 500,
+    color: 'var(--dsw-alias-state-warning-primary)',
+    opacity: 0.85,
     whiteSpace: 'nowrap',
   },
   tempRemoveBtn: {
