@@ -358,7 +358,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
         pushLog('info', `界面刷新完成（${((Date.now() - t2) / 1000).toFixed(1)}s），共耗时 ${((Date.now() - t0) / 1000).toFixed(1)}s`)
       } else {
         notify(r.error ?? '临时加载失败')
-        pushLog('err', `临时加载失败（${((t1 - t0) / 1000).toFixed(1)}s）：${r.error ?? '未知原因'}`)
+        // 错误详情已由步骤引擎的 run.lines 记录进日志，此处仅顶部 toast 一句话提示，不重复入日志。
       }
     } finally {
       setTempBusy(false)
@@ -419,7 +419,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     // 实时追踪：在真实操作执行期间就启动轮询，逐步刷新每步状态（而非等操作完成才一次性拿到）。
     pollSteps(runId)
     const fail = (text: string): void => {
-      pushLog('err', text)
+      // 错误详情已由服务端 run.lines 的 fail() 记录进日志，此处只结算骨架，避免同一错误重复入日志。
       if (stepView?.runId === runId) {
         stepView.done = true
         logSubscribe?.()
@@ -459,11 +459,8 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
           elapsed: s.elapsed,
           note: s.note,
         }
-        // 状态翻转时写一条尾部日志（仅 ok/err 或首次 running 且与步骤变化一致），逐步追踪观感。
-        if (!prev || prev.status !== s.status) {
-          if (s.status === 'ok') pushLog('ok', `✓ ${s.label}${s.elapsed ? `（${s.elapsed}）` : ''}${s.note ? `：${s.note}` : ''}`)
-          else if (s.status === 'err') pushLog('err', `✗ ${s.label}${s.note ? `：${s.note}` : ''}`)
-        }
+        // 骨架进度只更新 status/耗时（stepView 卡片渲染），不再在此 pushLog——
+        // 否则与下方 done 时 snap.lines 全量 push 形成双通道，同一 step 会被写两遍、顺序错乱（P-049 复现纠正）。
       }
       cur.states = states
       cur.done = snap.done ?? cur.done
@@ -544,7 +541,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
       await refresh()
     } else {
       notify(r.error ?? '转正失败')
-      pushLog('err', `转正 ${p.name} 失败：${r.error ?? '未知原因'}`)
+      // 错误详情已由步骤引擎的 run.lines 记录进日志，此处仅顶部 toast 一句话提示，不重复入日志。
     }
   }
 
@@ -559,7 +556,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
       await refresh()
     } else {
       notify(r.error ?? '卸载失败')
-      pushLog('err', `卸载临时插件 ${p.name} 失败：${r.error ?? '未知原因'}`)
+      // 错误详情已由步骤引擎的 run.lines 记录进日志，此处仅顶部 toast 一句话提示，不重复入日志。
     }
   }
 
@@ -579,7 +576,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
       await refresh()
     } else {
       notify(r.error ?? '卸载失败')
-      pushLog('err', `真卸载 ${p.name} 失败：${r.error ?? '未知原因'}`)
+      // 错误详情已由步骤引擎的 run.lines 记录进日志，此处仅顶部 toast 一句话提示，不重复入日志。
     }
   }
 
@@ -862,7 +859,11 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
                         <span style={s.stepRight}>
                           {st === 'running' && <span style={{ ...s.stepMeta, color: runColor }}>{'进行中…'}</span>}
                           {meta?.elapsed && <span style={s.stepMeta}>{meta.elapsed}</span>}
-                          {meta?.note && <span style={{ ...s.stepMeta, color: st === 'err' ? errColor : undefined }}>{meta.note}</span>}
+                          {meta?.note && (
+                          <span style={{ ...s.stepMeta, ...s.stepNote, color: st === 'err' ? errColor : undefined }} title={meta.note}>
+                            {st === 'err' ? '失败' : ''}
+                          </span>
+                        )}
                         </span>
                       </div>
                     )
@@ -1453,7 +1454,8 @@ const s: Record<string, CSSProperties> = {
   stepIconRunning: { animation: 'smStepPulse 1.2s ease-in-out infinite' },
   stepLabel: { color: 'var(--dsw-alias-label-primary)', fontWeight: 500 },
   stepRight: { marginLeft: 'auto', display: 'flex', gap: 8, flexShrink: 0 },
-  stepMeta: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' },
+    stepMeta: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' },
+    stepNote: { maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
   // 诊断占位
   diagnosePanel: {
     display: 'flex',

@@ -968,12 +968,14 @@ async function tempLoad(
       if (host?.profileDir) nodeModulesHit = String(existsSync(join(host.profileDir, 'node_modules', packageName)))
     } catch { /* 探测失败即 ? */ }
     markStep(run, 'assemble', 'err', reason)
-    console.log(`[dsh-simplemanager] tempLoad 热装失败 profileDir=${host?.profileDir} depsApplied=${depsApplied} nodeModulesHit=${nodeModulesHit} spec=${name} rootCause=${detail}`)
     const officialNote = officialPeers && officialPeers.length > 0
       ? '. 注意：该插件依赖官方业务包 ' + officialPeers.join('/') + '，桌面壳对动态热装的官方 peer 解析有限制，建议改用官方渠道安装后再用。'
       : ''
-    fail(`运行时热装失败（${packageName}）nodeModulesHit=${nodeModulesHit} exec=${basename(process.execPath)}/argv0=${basename(process.argv0 ?? '?')} profileDir=${host?.profileDir}${installNote}${officialNote}：${reason}`)
-    throw new Error(`运行时热装失败（${packageName}）nodeModulesHit=${nodeModulesHit} exec=${basename(process.execPath)}/argv0=${basename(process.argv0 ?? '?')} profileDir=${host?.profileDir}${installNote}${officialNote}：${reason}`)
+    // 诊断字段（nodeModulesHit/exec/argv0/profileDir）只进服务端日志，不堆进用户可见错误，避免 flash/日志冗长重复。
+    console.log(`[dsh-simplemanager] tempLoad 热装失败 profileDir=${host?.profileDir} depsApplied=${depsApplied} nodeModulesHit=${nodeModulesHit} exec=${basename(process.execPath)}/argv0=${basename(process.argv0 ?? '?')} spec=${name} rootCause=${detail}`)
+    const errText = `运行时热装失败（${packageName}）${installNote}${officialNote}：${reason}`
+    fail(errText)
+    throw new Error(errText)
   }
 
   // 4) 读 fiber 态供 UI 观测（create 成功但非 active 的极少数情况也如实上报）。
