@@ -3,7 +3,7 @@
  * 通过 webServer 暴露 `/simplemanager` 数据/操作 API 给桌面壳内 client 面板：
  *   - kernel   ：内核版本（当前 + 官方最新，仅提示不自动更新）
  *   - browse   ：完整状态（内核 + 文件夹 + 插件 + 备注），client 首载
- *   - toggle   ：启停第三方插件（写入全局层补丁 + 尽力热生效）
+ *   - toggle   ：启停第三方插件（写 profile patch 装配层 + 对运行 entry update({disabled}) 立即热生效）
  *   - refresh  ：重新扫描已安装插件（安装/卸载后可手动刷新）
  *   - folders  ：自定义文件夹增/改/删
  *   - move     ：把插件移动到某个文件夹
@@ -19,6 +19,8 @@ import {
   type PluginBundle,
   type PluginScope,
   effectiveFolder,
+  pnpmAdd,
+  specPackageName,
 } from './host.js'
 
 export const name = 'dsh-plugin-simplemanager'
@@ -37,10 +39,25 @@ type AppContext = Context & {
   }
 }
 
+/** Cordis FiberState 数字枚举 → 人类可读 phase（PENDING=0…UNLOADING=5，DISPOSED=4）。 */
+const FIBER_PHASE = ['pending', 'loading', 'active', 'failed', 'disposed', 'unloading'] as const
+type FiberPhaseName = 'pending' | 'loading' | 'active' | 'failed' | 'disposed' | 'unloading' | null
+
 /** loader 里一条插件条目的最小类型面（只读探测 + 尽力启发）。 */
 interface LoaderEntryLike {
-  options?: { name?: string }
+  id?: string
+  options?: { name?: string; group?: boolean }
   disabled?: boolean
+  /** FiberState 数字；无 fiber 时 undefined。 */
+  fiber?: { state?: number } | null
+}
+
+/** loader 存活态的捕获：enabled + fiberPhase（active/failed/pending…）。 */
+interface LoaderLive {
+  enabled: boolean
+  phase: FiberPhaseName
+  /** loader 树内的 entry id，供 update({ disabled }) 热启停定位。无则 undefined。 */
+  entryId?: string
 }
 
 interface FoldersView {
@@ -61,13 +78,17 @@ interface PluginView {
   version: string
   description: string
   scope: 'official' | 'shell' | 'third'
-  source: 'runtime' | 'profile'
+  source: 'runtime' | 'profile' | 'temp'
   enabled: boolean
   toggleable: boolean
   folder: string
   note: string
   /** 用户自定义显示名（缺省则用 name，UI 层兜底）。 */
   alias: string
+  /** 运行时状态：active=已活跃 / failed=启动失败 / pending=待加载 / loading=加载中 / disposed=已卸载 / unloading=卸载中 / null=无 fiber。 */
+  state: FiberPhaseName
+  /** true = 运行时临时加载（不在已安装扫描目录里、由本面板 loader.create 注入），重启即消失。 */
+  temporary: boolean
 }
 
 export function apply(ctx: AppContext): void {
@@ -79,20 +100,46 @@ export function apply(ctx: AppContext): void {
     const overlay = host.readOverlay()
     const catalog = host.scanCatalog()
     const patchEnabled = host.readPatchEnabledIds()
-    const loaderEnabled = loaderEnabledMap(ctx)
+    const live = loaderLiveMap(ctx)
 
+    // catalog（已安装）里每个 bundle 的视图
     const plugins: PluginView[] = catalog.map((b) => ({
       name: b.name,
       version: b.version,
       description: b.description,
       scope: b.scope,
       source: b.source,
-      enabled: enabledFor(b, patchEnabled, loaderEnabled),
+      enabled: enabledFor(b, patchEnabled, live),
       toggleable: b.scope === 'third' || patchEnabled.has(b.name),
       folder: effectiveFolder(b, overlay),
       note: overlay.notes[b.name] ?? '',
       alias: overlay.aliases[b.name] ?? '',
+      state: live.get(b.name)?.phase ?? null,
+      temporary: false,
     }))
+
+    // 仅本面板会话里 tempLoad 临时 create 过、且不在已安装扫描目录中的 entry
+    // → 运行时临时插件（重启即消失）。已装未装配 / cordis: 内置不算临时，不展示为临时。
+    const catalogNames = new Set(plugins.map((p) => p.name))
+    for (const [name, { enabled, phase }] of live) {
+      if (name.startsWith('cordis:') || name === '@deepseek-ai/cordis-plugin-loader') continue
+      if (catalogNames.has(name)) continue
+      if (!tempInfos.has(name)) continue
+      plugins.push({
+        name,
+        version: '',
+        description: '',
+        scope: 'third',
+        source: 'temp',
+        enabled,
+        toggleable: true,
+        folder: effectiveFolder({ name, scope: 'third' }, overlay),
+        note: '',
+        alias: '',
+        state: phase,
+        temporary: true,
+      })
+    }
 
     const count = (id: string, scope: 'official' | 'third'): number =>
       plugins.filter((p) => effectiveFolder(p, overlay) === id).length
@@ -176,7 +223,17 @@ export function apply(ctx: AppContext): void {
 
           if (action === 'browse' || action === 'refresh') {
             // refresh 时强制重新扫描文件系统；browse 每次都是实时扫描，语义等价
-            return send({ ok: true, ...buildView() })
+            const live = loaderLiveMap(ctx)
+            const catalog = host.scanCatalog()
+            const _debug = {
+              live: { count: live.size, sample: [...live.keys()].slice(0, 12) },
+              catalog: {
+                count: catalog.length,
+                hasAnysearch: catalog.some((b) => b.name.includes('anysearch')),
+              },
+              loaderKeysWithAnysearch: [...live.keys()].filter((k) => k.toLowerCase().includes('anysearch')),
+            }
+            return send({ ok: true, ...buildView(), _debug })
           }
 
           if (action === 'toggle') {
@@ -186,15 +243,25 @@ export function apply(ctx: AppContext): void {
             const bundle = host.scanCatalog().find((b) => b.name === id)
             if (!bundle) return fail('插件不存在: ' + id)
             const patchEnabled = host.readPatchEnabledIds()
-            const live = loaderEnabledMap(ctx).get(id)
-            const next = live === undefined ? !patchEnabled.has(id) : !live
-            try {
-              host.setPatchEnabled(id, id, next)
-              const hotApplied = await hotApplyLoader(ctx, id, next)
-              return send({ ok: true, enabled: next, hotApplied })
-            } catch (error) {
-              return fail(error instanceof Error ? error.message : String(error))
+            const live = loaderLiveMap(ctx).get(id)
+            const next = live === undefined ? !patchEnabled.has(id) : !live.enabled
+            // 持久化装配层：仍写 profile patch（insert 增删），保证重启后装配状态正确。
+            host.setPatchEnabled(id, id, next)
+            // 运行时热启停：对已装配 entry 做 update({ disabled }) 立即生效（非 reload，reload 不具备）。
+            // 停=dispose 保留条目；启=重新启动 fiber。找不到运行 entry（未装配）则仅落盘、走重启装配。
+            let hotApplied = false
+            if (live?.entryId) {
+              const loader = ctx.get('loader') as LoaderWriteFace | undefined
+              try {
+                if (loader && typeof loader.update === 'function') {
+                  await loader.update(live.entryId, { disabled: !next })
+                  hotApplied = true
+                }
+              } catch {
+                hotApplied = false // 运行时更新失败，落盘已生效，走重启生效
+              }
             }
+            return send({ ok: true, enabled: next, hotApplied, ...buildView() })
           }
 
           if (action === 'folders') {
@@ -257,6 +324,42 @@ export function apply(ctx: AppContext): void {
             return send({ ok: true, ...buildView() })
           }
 
+          if (action === 'tempLoad') {
+            const body = await readJsonBody(req)
+            const spec = typeof body.name === 'string' ? body.name : ''
+            if (!spec.trim()) return fail('缺少要临时加载的插件名')
+            try {
+              const { entryId, depsApplied, pnpmReason } = await tempLoad(ctx, host, spec)
+              return send({ ok: true, entryId, depsApplied, pnpmReason, ...buildView() })
+            } catch (error) {
+              return fail(error instanceof Error ? error.message : String(error))
+            }
+          }
+
+          if (action === 'tempRemove') {
+            const body = await readJsonBody(req)
+            const id = typeof body.id === 'string' ? body.id : ''
+            if (!id) return fail('缺少插件 id')
+            try {
+              await tempRemove(ctx, id)
+              return send({ ok: true, ...buildView() })
+            } catch (error) {
+              return fail(error instanceof Error ? error.message : String(error))
+            }
+          }
+
+          if (action === 'promote') {
+            const body = await readJsonBody(req)
+            const id = typeof body.id === 'string' ? body.id : ''
+            if (!id) return fail('缺少插件 id')
+            try {
+              const { packageName, assembled } = await promote(ctx, host, id)
+              return send({ ok: true, packageName, assembled, requiresRestart: true, ...buildView() })
+            } catch (error) {
+              return fail(error instanceof Error ? error.message : String(error))
+            }
+          }
+
           send({ ok: false, error: 'unknown action: ' + action })
         },
       }),
@@ -264,15 +367,48 @@ export function apply(ctx: AppContext): void {
   )
 }
 
-/** loader 的 live enabled 映射（moduleName -> !disabled）。loader 不可用返回空 Map。 */
-function loaderEnabledMap(ctx: Context): Map<string, boolean> {
+/** plugin-inventory 服务最小面：官方 `PluginInventoryGateway.list()`（host 同步可用）。 */
+interface PluginInventoryFace {
+  list(): { entries?: Array<{ entryId?: string; moduleName?: string; enabled?: boolean; fiberPhase?: string | null }> }
+}
+
+/** loader 存活态捕获（moduleName / !disabled + fiberPhase）。优先走官方 pluginInventory（权威且在 host 生效），
+ * 失败回退 loader 直读；两者均不可用返回空 Map。 */
+function loaderLiveMap(ctx: Context): Map<string, LoaderLive> {
+  const pinv = ctx.get('pluginInventory') as PluginInventoryFace | undefined
+  if (pinv && typeof pinv.list === 'function') {
+    const map = new Map<string, LoaderLive>()
+    try {
+      const entries = pinv.list().entries
+      if (entries) {
+        for (const e of entries) {
+          const nm = e?.moduleName
+          if (typeof nm !== 'string' || !nm) continue
+          map.set(nm, {
+            enabled: !!e.enabled,
+            phase: (e.fiberPhase ?? null) as FiberPhaseName,
+            entryId: e.entryId,
+          })
+        }
+      }
+      return map
+    } catch {
+      /* fallthrough to loader 直读 */
+    }
+  }
   const loader = ctx.get('loader') as { entries?: () => LoaderEntryLike[] } | undefined
   if (!loader || typeof loader.entries !== 'function') return new Map()
+  const map = new Map<string, LoaderLive>()
   try {
-    const map = new Map<string, boolean>()
     for (const entry of loader.entries() ?? []) {
       const nm = entry?.options?.name
-      if (typeof nm === 'string' && nm) map.set(nm, !entry.disabled)
+      if (typeof nm !== 'string' || !nm) continue
+      const rawState = entry.fiber?.state
+      const phase: FiberPhaseName =
+        typeof rawState === 'number' && rawState >= 0 && rawState < FIBER_PHASE.length
+          ? (FIBER_PHASE[rawState] as FiberPhaseName)
+          : null
+      map.set(nm, { enabled: !entry.disabled, phase, entryId: entry.id ?? nm })
     }
     return map
   } catch {
@@ -280,30 +416,82 @@ function loaderEnabledMap(ctx: Context): Map<string, boolean> {
   }
 }
 
-function enabledFor(b: PluginBundle, patchEnabled: Set<string>, loaderEnabled: Map<string, boolean>): boolean {
+function enabledFor(b: PluginBundle, patchEnabled: Set<string>, live: Map<string, LoaderLive>): boolean {
+  const state = live.get(b.name)
   if (b.scope === 'official' || b.scope === 'shell') {
-    const live = loaderEnabled.get(b.name)
-    return live === undefined ? true : live
+    return state === undefined ? true : state.enabled
   }
-  const live = loaderEnabled.get(b.name)
-  return live === undefined ? patchEnabled.has(b.name) : live
+  return state === undefined ? patchEnabled.has(b.name) : state.enabled
+}
+
+/** loader 的最小写面（create/remove/update），与官方 EntryTree 生命接口对齐。 */
+interface LoaderWriteFace {
+  create(options: { name: string; config?: Record<string, unknown> }, parent?: string | null): Promise<string>
+  remove(id: string): Promise<void>
+  /** 差异化热更新入口：改 disabled 走 dispose/重建，改 config 走原地热更新。 */
+  update(id: string, options: { disabled?: boolean; name?: string; config?: Record<string, unknown> }): Promise<void>
+  entries(): Iterable<{ id?: string; options?: { name?: string } }>
+}
+
+/** 临时闭包：resolve 名 → { entryId, spec（pnpm add 用的原始 spec） }。临时插件随进程消亡，无需落盘。 */
+const tempInfos = new Map<string, { entryId: string; spec: string }>()
+
+/**
+ * 运行时临时加载一个可解析的插件（npm 包名 / cordis: 内置 / 本地目录）。
+ * 走 loader 根树 create（write 为 no-op，不落盘，重启即消失）。
+ * 加载前先做一次普适化依赖获取（pnpm add 到 profile 共享 node_modules），
+ * 确保任意插件（即便自带 node_modules 不全）的依赖都能被 resolve；依赖获取失败不阻塞热注入。
+ */
+async function tempLoad(
+  ctx: Context,
+  host: SimpleManagerHost | null,
+  spec: string,
+): Promise<{ entryId: string; depsApplied: boolean; pnpmReason?: string }> {
+  const name = spec.trim()
+  if (!name) throw new Error('缺少要临时加载的插件名')
+  const loader = ctx.get('loader') as LoaderWriteFace | undefined
+  if (!loader || typeof loader.create !== 'function') throw new Error('loader 不可用，无法临时加载')
+  if (tempInfos.has(name)) throw new Error(`「${name}」已经临时加载过了`)
+
+  let depsApplied = false
+  let pnpmReason: string | undefined
+  if (host && host.profileDir) {
+    const out = pnpmAdd(host.profileDir, name)
+    depsApplied = out.ok
+    if (!depsApplied) pnpmReason = out.message
+  }
+
+  const entryId = await loader.create({ name })
+  tempInfos.set(name, { entryId, spec: name })
+  return { entryId, depsApplied, pnpmReason }
+}
+
+/** 卸载一只临时插件（只接受本面板临时 create 过的 entry）。 */
+async function tempRemove(ctx: Context, name: string): Promise<void> {
+  const loader = ctx.get('loader') as LoaderWriteFace | undefined
+  if (!loader || typeof loader.remove !== 'function') throw new Error('loader 不可用，无法卸载')
+  const info = tempInfos.get(name)
+  if (!info) throw new Error(`「${name}」不是本面板临时加载的插件，不能从这里卸载`)
+  await loader.remove(info.entryId)
+  tempInfos.delete(name)
 }
 
 /**
- * 尽力让启停"实时热生效"：优先走 loader.reload()（重读装配后热加载）；
- * 没有配合面时保守返回 hotApplied=false，由 UI 提示"将在重启后生效"。
+ * 真注入：把一只临时插件持久化装配进 profile。
+ * 1) pnpm add <spec> —— 把插件物理装入共享 node_modules 并装齐依赖闭包（普适化依赖获取）；
+ * 2) 写 profile 层 patch（setPatchEnabled）把插件真实包名登记进装配清单 → 重启后被 loader 装配。
+ * 登记走官方「profile 层 patch 最后应用」语义，不依赖插件是否声明 dsh.bundle.patch。
  */
-async function hotApplyLoader(ctx: Context, name: string, enabled: boolean): Promise<boolean> {
-  const loader = ctx.get('loader') as { reload?: () => Promise<unknown> | unknown } | undefined
-  try {
-    if (loader && typeof loader.reload === 'function') {
-      await loader.reload()
-      return true
-    }
-  } catch {
-    /* 热应用失败，落盘已生效，走重启生效 */
-  }
-  return false
+async function promote(ctx: Context, host: SimpleManagerHost, name: string): Promise<{ packageName: string; assembled: boolean }> {
+  const info = tempInfos.get(name)
+  if (!info) throw new Error(`「${name}」不是本面板临时加载的插件，无法转正`)
+  const outcome = pnpmAdd(host.profileDir, info.spec)
+  if (!outcome.ok) throw new Error(`依赖安装失败：${outcome.message}`)
+  const packageName = specPackageName(info.spec) ?? name
+  const assembled = host.setPatchEnabled(packageName, packageName, true)
+  // 已持久化装配：从临时闭包移除，重启后由 patch 装配（本次进程内原临时 entry 仍运行至退出）。
+  tempInfos.delete(name)
+  return { packageName, assembled }
 }
 
 /** 读内核发布双通道；实例级缓存避免频繁打 registry（TTL 6h）。 */

@@ -18,7 +18,7 @@
 
 > 版本化说明：本插件为扁平活插件（`dsh plugin add ./dsh-c`）。`dsh-v0.1.1-rc.1/` 为**首个版本化目录**；
 > `dsh-v0.1.1-rc.2/` 由 `dsh-v0.1.1-rc.1` 按标准四件套 `robocopy /E /SL` 复制（<PREV> 已是标准结构，无需扁平归一化），
-> 仅重指 typecheck 环境 + 改写契约文档，`plugin/src` 无代码改动。
+> 仅重指 typecheck 环境 + 改写契约文档。适配后（见 `CHANGELOG.md` §4）又追加了插件自身功能演进（运行时状态徽标 + 临时加载/卸载）。
 
 ## 官方安装 / 卸载（bundle 装配）
 

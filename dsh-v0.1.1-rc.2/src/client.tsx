@@ -39,12 +39,16 @@ interface Plugin {
   version: string
   description: string
   scope: 'official' | 'shell' | 'third'
-  source: 'runtime' | 'profile'
+  source: 'runtime' | 'profile' | 'temp'
   enabled: boolean
   toggleable: boolean
   folder: string
   note: string
   alias: string
+  /** 运行时状态：active=已活跃 / failed=启动失败 / pending=待加载 / loading=加载中 / disposed=已卸载 / unloading=卸载中 / null=无 fiber。 */
+  state: 'active' | 'failed' | 'pending' | 'loading' | 'disposed' | 'unloading' | null
+  /** true = 运行时临时加载，重启即消失。 */
+  temporary: boolean
 }
 
 interface Browse {
@@ -89,6 +93,9 @@ function SimpleManagerTab(): JSX.Element | null {
   const [flash, setFlash] = useState('')
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
+  const [tempWanted, setTempWanted] = useState(false)
+  const [tempInput, setTempInput] = useState('')
+  const [tempBusy, setTempBusy] = useState(false)
   const dragName = useRef('')
 
   const refresh = useCallback(async () => {
@@ -138,6 +145,62 @@ function SimpleManagerTab(): JSX.Element | null {
     if (!r.ok) return notify(r.error ?? '启停失败')
     await refresh()
     notify(r.enabled ? '已启用' + (r.hotApplied ? '' : '（重启后生效）') : '已停用' + (r.hotApplied ? '' : '（重启后生效）'))
+  }
+
+  const tempLoad = async (): Promise<void> => {
+    const name = tempInput.trim()
+    if (!name) return
+    setTempBusy(true)
+    try {
+      const r = await api<{ ok: boolean; error?: string; depsApplied?: boolean; pnpmReason?: string }>(`${API}/tempLoad`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ name }),
+      })
+      if (r.ok) {
+        if (r.depsApplied) notify('已临时加载（依赖已装齐），重启后自动消失')
+        else notify(`已临时加载，但依赖获取失败（${r.pnpmReason ?? '未知'}）`)
+        setTempInput('')
+        setTempWanted(false)
+        await refresh()
+      } else {
+        notify(r.error ?? '临时加载失败')
+      }
+    } finally {
+      setTempBusy(false)
+    }
+  }
+
+  const promote = async (p: Plugin): Promise<void> => {
+    if (!window.confirm(`真注入插件「${p.name}」？\n将安装其依赖闭包并写入 profile 装配清单，重启后持久生效（本次进程结束前仍为临时）。`)) {
+      return
+    }
+    const r = await api<{ ok: boolean; error?: string; packageName?: string }>(`${API}/promote`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: p.name }),
+    })
+    if (r.ok) {
+      notify(`已转正「${r.packageName ?? p.name}」，重启后生效`)
+      await refresh()
+    } else {
+      notify(r.error ?? '转正失败')
+    }
+  }
+
+  const tempRemove = async (p: Plugin): Promise<void> => {
+    if (!window.confirm(`卸载临时插件「${p.name}」？仅当前进程移除，不影响磁盘。`)) return
+    const r = await api<{ ok: boolean; error?: string }>(`${API}/tempRemove`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ id: p.name }),
+    })
+    if (r.ok) {
+      notify('已卸载临时插件')
+      await refresh()
+    } else {
+      notify(r.error ?? '卸载失败')
+    }
   }
 
   const move = (pluginName: string, folder: string): void => {
@@ -260,6 +323,29 @@ function SimpleManagerTab(): JSX.Element | null {
             <span style={s.cardsCount}>{`${activePlugins.length} 个插件`}</span>
           </div>
 
+          <div style={s.tempBar}>
+            {tempWanted ? (
+              <>
+                <input
+                  style={{ ...s.input, flex: 1 }}
+                  autoFocus
+                  value={tempInput}
+                  placeholder="插件名（已安装未装配 / cordis: 内置，或本地目录路径）"
+                  onChange={(e) => setTempInput(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') void tempLoad()
+                    if (e.key === 'Escape') setTempWanted(false)
+                  }}
+                />
+                <button style={s.primaryBtn} disabled={tempBusy} onClick={() => void tempLoad()}>{'临时加载'}</button>
+                <button style={s.ghostBtn} onClick={() => setTempWanted(false)}>{'取消'}</button>
+                <span style={s.tempHint}>{'仅当前进程生效，重启即消失'}</span>
+              </>
+            ) : (
+              <button style={s.ghostBtn} onClick={() => setTempWanted(true)}>{'+ 运行时临时加载插件'}</button>
+            )}
+          </div>
+
           {activePlugins.length === 0 ? (
             <div style={s.empty}>{'此文件夹暂没有插件。拖拽左侧其它文件夹的插件卡片到这里，即可重新分类。'}</div>
           ) : (
@@ -272,6 +358,8 @@ function SimpleManagerTab(): JSX.Element | null {
                   onToggle={() => void toggle(p)}
                   onSaveNote={(n) => void saveNote(p, n)}
                   onRename={(alias) => void renamePlugin(p, alias)}
+                  onPromote={() => void promote(p)}
+                  onTempRemove={() => void tempRemove(p)}
                 />
               ))}
             </div>
@@ -366,6 +454,8 @@ interface CardProps {
   onToggle(): void
   onSaveNote(note: string): void
   onRename(alias: string): void
+  onPromote(): void
+  onTempRemove(): void
 }
 
 function PluginCard(p: CardProps): JSX.Element {
@@ -388,17 +478,31 @@ function PluginCard(p: CardProps): JSX.Element {
   const badgeStyle =
     p.plugin.scope === 'official' ? s.badge : p.plugin.scope === 'shell' ? s.badgeShell : s.badgeThird
   const displayName = p.plugin.alias || p.plugin.name
+  const stateInfo = STATE_INFO[p.plugin.state ?? 'none']
+  const stateStyle = STATE_STYLE[p.plugin.state ?? 'none']
 
   return (
     <div style={s.card} draggable onDragStart={p.onDragStart}>
       <div style={s.cardHead}>
         <span style={badgeStyle}>{scopeLabel}</span>
-        <label style={s.switchLabel} title={p.plugin.toggleable ? '点击启停' : '内置插件不可停用'}>
-          <input style={s.checkboxHidden} type="checkbox" checked={p.plugin.enabled} disabled={!p.plugin.toggleable} onChange={p.onToggle} />
-          <span style={{ ...s.switch, background: p.plugin.enabled ? 'var(--dsw-alias-state-business-primary)' : 'var(--dsw-alias-bg-layer-3)' }}>
-            <span style={{ ...s.knob, transform: p.plugin.enabled ? 'translateX(16px)' : 'translateX(0)' }} />
-          </span>
-        </label>
+        <span style={s.headRight}>
+          {p.plugin.temporary && (
+            <span style={s.tempBadge} title="运行时临时加载，重启即消失">{'临时'}</span>
+          )}
+          <span style={stateStyle}>{stateInfo}</span>
+          <label style={s.switchLabel} title={p.plugin.toggleable ? '点击启停' : '内置插件不可停用'}>
+            <input style={s.checkboxHidden} type="checkbox" checked={p.plugin.enabled} disabled={!p.plugin.toggleable} onChange={p.onToggle} />
+            <span style={{ ...s.switch, background: p.plugin.enabled ? 'var(--dsw-alias-state-business-primary)' : 'var(--dsw-alias-bg-layer-3)' }}>
+              <span style={{ ...s.knob, transform: p.plugin.enabled ? 'translateX(16px)' : 'translateX(0)' }} />
+            </span>
+          </label>
+          {p.plugin.temporary && (
+            <>
+              <button style={s.promoteBtn} title="真注入：安装依赖并写入装配清单，重启后持久生效" onClick={p.onPromote}>{'转正'}</button>
+              <button style={s.tempRemoveBtn} title="卸载临时插件（仅当前进程，不影响磁盘）" onClick={p.onTempRemove}>{'✕'}</button>
+            </>
+          )}
+        </span>
       </div>
 
       {renaming ? (
@@ -461,6 +565,48 @@ function PluginCard(p: CardProps): JSX.Element {
       </div>
     </div>
   )
+}
+
+/** 运行时状态 → 文案。'none' 表示无活跃 fiber（如仅停用、未加载）。 */
+const STATE_INFO: Record<string, string> = {
+  active: '运行中',
+  failed: '失败',
+  pending: '待加载',
+  loading: '加载中',
+  disposed: '已卸载',
+  unloading: '卸载中',
+  none: '未加载',
+}
+
+/** 运行时状态徽标的基础样式（模块级常量，先于 STATE_STYLE 定义）。 */
+const statePillBase: CSSProperties = {
+  padding: '1px 7px',
+  borderRadius: 5,
+  fontSize: 12,
+  fontWeight: 500,
+  fontFamily: 'var(--ds-font-family-code)',
+  whiteSpace: 'nowrap',
+  color: 'var(--dsw-alias-label-secondary)',
+  background: 'var(--dsw-alias-bg-module-platform)',
+}
+
+/** 运行时状态 → 徽标样式（色彩语义：active=成功 / failed=危险 / 其它=中性）。 */
+const STATE_STYLE: Record<string, CSSProperties> = {
+  active: {
+    ...statePillBase,
+    color: 'var(--dsw-alias-state-success-primary)',
+    background: 'color-mix(in srgb, var(--dsw-alias-state-success-primary) 13%, transparent)',
+  },
+  failed: {
+    ...statePillBase,
+    color: 'var(--dsw-alias-state-danger-primary)',
+    background: 'color-mix(in srgb, var(--dsw-alias-state-danger-primary) 13%, transparent)',
+  },
+  pending: statePillBase,
+  loading: statePillBase,
+  disposed: statePillBase,
+  unloading: statePillBase,
+  none: { ...statePillBase, color: 'var(--dsw-alias-label-tertiary)', background: 'transparent' },
 }
 
 const s: Record<string, CSSProperties> = {
@@ -601,6 +747,55 @@ const s: Record<string, CSSProperties> = {
   cardsHeader: { display: 'flex', alignItems: 'baseline', gap: 8, padding: '0 2px' },
   cardsTitle: { fontSize: 15, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', margin: 0 },
   cardsCount: { color: 'var(--dsw-alias-label-tertiary)', fontSize: 12 },
+  tempBar: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '6px 10px',
+    borderRadius: 9,
+    background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 8%, transparent)',
+    border: '1px dashed var(--dsw-alias-border-l2)',
+  },
+  tempHint: { color: 'var(--dsw-alias-label-tertiary)', fontSize: 11, marginLeft: 'auto', whiteSpace: 'nowrap' },
+  ghostBtn: {
+    border: '1px solid var(--dsw-alias-border-l2)',
+    background: 'transparent',
+    color: 'var(--dsw-alias-label-secondary)',
+    borderRadius: 6,
+    padding: '4px 10px',
+    cursor: 'pointer',
+    fontSize: 12,
+    flexShrink: 0,
+  },
+  headRight: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
+  tempBadge: {
+    padding: '1px 6px',
+    borderRadius: 5,
+    fontSize: 11,
+    fontWeight: 600,
+    color: 'var(--dsw-alias-state-warning-primary)',
+    background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 14%, transparent)',
+    whiteSpace: 'nowrap',
+  },
+  tempRemoveBtn: {
+    border: 'none',
+    background: 'transparent',
+    color: 'var(--dsw-alias-label-tertiary)',
+    cursor: 'pointer',
+    padding: '0 3px',
+    fontSize: 12,
+    lineHeight: 1,
+  },
+  promoteBtn: {
+    border: '1px solid var(--dsw-alias-state-warning-primary)',
+    background: 'transparent',
+    color: 'var(--dsw-alias-state-warning-primary)',
+    borderRadius: 6,
+    padding: '1px 8px',
+    cursor: 'pointer',
+    fontSize: 11, fontWeight: 600,
+    whiteSpace: 'nowrap',
+  },
   flash: {
     padding: '8px 12px',
     borderRadius: 7,

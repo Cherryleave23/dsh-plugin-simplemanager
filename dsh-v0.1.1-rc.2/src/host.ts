@@ -3,9 +3,10 @@
  * 职责：内核版本读取/检测、已安装插件目录扫描、启停的全局层补丁读写、
  * 自持分类/备注 overlay 持久化。不持有 ctx，纯函数 + 文件系统，便于测试。
  */
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { mkdirSync, readFileSync, writeFileSync, renameSync, existsSync, readdirSync } from 'node:fs'
 import { createRequire } from 'node:module'
+import { spawnSync, type SpawnSyncReturns } from 'node:child_process'
 
 export type PluginScope = 'official' | 'shell' | 'third'
 
@@ -224,7 +225,8 @@ export class SimpleManagerHost {
         for (const scope of readdirSafe(scoped)) {
           for (const inner of readdirSafe(join(scoped, scope))) {
             const name = '@' + scope + '/' + inner
-            pushProfileBundle(out, seen, profileModules, name.replace(/^@/, ''), name, overrides)
+            // rel 必须保留 '@' 子目录（如 @anysearch/anysearch-dsh），否则 join 会错误落到 node_modules/anysearch/…
+            pushProfileBundle(out, seen, profileModules, '@' + scope + '/' + inner, name, overrides)
           }
         }
       }
@@ -321,7 +323,7 @@ export function defaultFolderFor(scope: PluginScope): string {
   return scope === 'official' ? 'official' : 'third'
 }
 
-export function effectiveFolder(bundle: PluginBundle, overlay: Overlay): string {
+export function effectiveFolder(bundle: Pick<PluginBundle, 'name' | 'scope'>, overlay: Overlay): string {
   return overlay.assignments[bundle.name] ?? defaultFolderFor(bundle.scope)
 }
 
@@ -455,4 +457,93 @@ export function editPatch(text: string, id: string, name: string, enable: boolea
   }
   lines.splice(itemIndex, end - itemIndex + 1)
   return lines.join('\n')
+}
+
+// ---------------------------------------------------------------------------
+// pnpm 装配器（真注入 / 依赖获取）
+// 与官方 `dsh plugin`（thin pnpm forwarder）同向：在 profile 目录跑 pnpm，
+// 依赖闭包装进共享 node_modules（nodeLinker=hoisted）。本函数只负责
+// "把插件物理装入 + 装依赖"；装配登记（写入 profile patch）由调用方
+// 复用 setPatchEnabled 完成。
+// ---------------------------------------------------------------------------
+
+export interface PnpmOutcome {
+  /** true = pnpm 成功退出。 */
+  ok: boolean
+  /** 子进程退出码；pnpm 非 ENOENT 异常时 null。 */
+  code: number | null
+  message: string
+}
+
+/** 判断一个 pnpm spec 是「本地文件/目录」还是「registry 包名」。 */
+export type PluginSpecKind = 'file' | 'registry'
+
+export interface AnchoredSpec {
+  /** 传给 pnpm add 的最终参数。 */
+  arg: string
+  kind: PluginSpecKind
+}
+
+/**
+ * 规范化 pnpm add 的 spec：本地路径（绝对或相对）→ `file:<绝对路径>`；
+ * `file:`/`link:` 前缀原样透传；其余按 registry 包名。
+ * 锚定基准 cwd 取插件管家进程运行目录（与官方 anchorPathSpec 同向）。
+ */
+export function anchorSpec(spec: string, cwd: string = process.cwd()): AnchoredSpec {
+  const s = spec.trim()
+  if (s.startsWith('file:') || s.startsWith('link:')) return { arg: s, kind: 'file' }
+  if (isAbsolute(s)) return { arg: 'file:' + s, kind: 'file' }
+  if (/^\.{1,2}([\\/]|$)/.test(s)) return { arg: 'file:' + resolve(cwd, s), kind: 'file' }
+  return { arg: s, kind: 'registry' }
+}
+
+/** 由 spec（或已装好的 package.json）解析插件真实包名；解析不到返回 null。 */
+export function specPackageName(spec: string, cwd: string = process.cwd()): string | null {
+  const { arg, kind } = anchorSpec(spec, cwd)
+  if (kind === 'registry') return spec.trim()
+  const dir = arg.replace(/^file:/, '').replace(/^link:/, '')
+  const meta = readJson(join(dir, 'package.json'))
+  return typeof meta.name === 'string' && meta.name ? meta.name : null
+}
+
+/**
+ * 在 profile 目录跑一次 `pnpm add <spec>`：把插件物理装入共享 node_modules，
+ * 并装齐其依赖闭包（普适化依赖获取，不假设插件自带 node_modules）。
+ * ENOENT（pnpm 不在 PATH）返回 code=127。阻塞式，依赖获取通常数秒完成。
+ */
+export function pnpmAdd(profileDir: string, spec: string, timeoutMs = 120000): PnpmOutcome {
+  const { arg } = anchorSpec(spec)
+  let result: SpawnSyncReturns<string>
+  try {
+    result = spawnSync('pnpm', ['add', arg], {
+      cwd: profileDir,
+      encoding: 'utf8',
+      shell: process.platform === 'win32',
+      timeout: timeoutMs,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (error) {
+    return { ok: false, code: null, message: String(error) }
+  }
+  if (result.error) {
+    const errno = result.error as NodeJS.ErrnoException
+    if (errno.code === 'ENOENT') {
+      return { ok: false, code: 127, message: 'pnpm 不在 PATH，无法安装依赖（请先安装 pnpm）' }
+    }
+    return { ok: false, code: null, message: errno.message }
+  }
+  const code = result.status ?? 1
+  if (code === 0) return { ok: true, code, message: 'pnpm add 成功' }
+  const stderr = (result.stderr ?? '').trim()
+  return { ok: false, code, message: lastLines(stderr) || 'pnpm add 失败' }
+}
+
+/** 取错误/日志的最后几行，做简洁提示。 */
+function lastLines(text: string, n = 2): string {
+  return text
+    .split(/\r?\n/)
+    .filter((l) => l.trim())
+    .slice(-n)
+    .join(' · ') || ''
 }

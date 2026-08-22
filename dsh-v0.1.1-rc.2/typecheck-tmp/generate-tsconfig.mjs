@@ -54,9 +54,9 @@ const config = {
   // 与插件自身 tsconfig 的宿主 typecheck 范围对齐：client.tsx 是 client 包（tsdown 构建，
   // 浏览器侧类型面），不参与宿主 tsc 平面；三平面纪律禁止跨平面混检。
   include: [
-    '../plugin/src/index.ts',
-    '../plugin/src/host.ts',
-    '../plugin/src/shims.d.ts',
+    '../src/index.ts',
+    '../src/host.ts',
+    '../src/shims.d.ts',
   ],
 }
 
