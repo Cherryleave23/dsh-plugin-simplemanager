@@ -232,26 +232,30 @@ function pickNodeRunner(): string {
 }
 
 /**
- * 解析一次 pnpm 调用方式。优先已就绪实装（离线），其次桌面捆绑，最后裸命令。
+ * 解析一次 pnpm 调用方式。官方能力优先：corepack 精确缓存 → 官方裸命令 pnpm（PATH/npx）→
+ * desktop 捆绑 app.asar 仅作最后回退。官方（纯 dsh/CLI）环境完整可用，desktop 只是适配。
  * 每次成功结果缓存，后续复用（避免重复磁盘扫描）。
  */
 function resolvePnpmInvocation(profileDir: string): PnpmInvocation {
   if (cachedInvocation) return cachedInvocation
   const wanted = profilePnpmVersion(profileDir)
-  const all: Array<{ ver: string; entry: string; kind: PnpmInvocation['kind'] }> = []
+  const ready: Array<{ ver: string; entry: string }> = []
   for (const home of COREPACK_HOMES.map(expandEnvVar)) {
     if (!home) continue
-    for (const c of cachedPnpmEntries(home)) all.push({ ...c, kind: 'node-cached' })
+    for (const c of cachedPnpmEntries(home)) ready.push(c)
   }
-  const bundled = bundledPnpmEntry()
-  if (bundled) all.push({ ...bundled, kind: 'node-bundled' })
-  // 版本匹配优先：corepack 缓存的精确版本 > 任意已就绪版本 > 桌面捆绑 > 裸命令。
-  const exact = all.find((c) => c.ver === wanted)
-  const anyReady = all.find((c) => c.kind === 'node-cached') ?? all[0]
-  const pick = exact ?? anyReady
-  cachedInvocation = pick
-    ? { file: pickNodeRunner(), prefixArgs: [pick.entry], kind: pick.kind }
-    : { file: 'pnpm', prefixArgs: [], kind: 'command' }
+  // 官方路径第一优先：corepack 精确缓存；缺失时直接回退官方裸命令 pnpm（系统 PATH / npx 均可解析）。
+  const caches = ready.filter((c) => c.ver === wanted)
+  if (caches.length > 0) {
+    cachedInvocation = { file: pickNodeRunner(), prefixArgs: [caches[0].entry], kind: 'node-cached' }
+    return cachedInvocation
+  }
+  if (ready.length > 0) {
+    cachedInvocation = { file: pickNodeRunner(), prefixArgs: [ready[0].entry], kind: 'node-cached' }
+    return cachedInvocation
+  }
+  // 官方裸命令：纯官方 dsh/CLI 环境由 PATH/corepack/npx 解析 pnpm，不依赖桌面壳。
+  cachedInvocation = { file: 'pnpm', prefixArgs: [], kind: 'command' }
   return cachedInvocation
 }
 
@@ -306,6 +310,23 @@ export function assertSafeTarget(arg: string, kind: PluginSpecKind): string | nu
   if (/[%!]/.test(arg)) return '含 cmd 展开危险字符'
   if (kind === 'file') return null
   if (!TARGET_RE.test(arg)) return '含不允许的字符'
+  return null
+}
+
+/**
+ * 校验 file: 目标的路径部分是否纯 ASCII。pnpm/node 的 ESM loader 对含非 ASCII 目录的
+ * `file:` 导入存在固有限制（Windows 实测中文路径会 `Directory import 'D:\AI\'` 截断失败），
+ * 故热装/转正等 file 安装必须在交给 pnpm 前置校验，命中则拒绝并给出可操作中文提示。
+ * 返回 null 表示安全；否则返回面向用户的中文提示。
+ */
+export function assertAsciiFileTarget(arg: string): string | null {
+  if (!arg.startsWith('file:')) return null
+  const clean = arg.slice('file:'.length)
+  // ASCII 字符集之外的所有码点；空格(U+0020)属 ASCII 放行。
+  if (/[^\x00-\x7F]/.test(clean)) {
+    const hint = 'C:\\dsh-test\\<package>'
+    return '路径含非 ASCII 字符（中/日/韩、全角标点、重音字母等），而 file: 安装要求纯 ASCII 路径（pnpm 对含非 ASCII 目录的导入会截断失败）。请把插件目录放到纯英文路径（如 ' + hint + '）后重试，或将项目迁到纯英文路径再安装'
+  }
   return null
 }
 
@@ -521,6 +542,10 @@ export async function pnpmAdd(profileDir: string, spec: string, options: { timeo
   const unsafe = assertSafeTarget(arg, kind)
   if (unsafe !== null) {
     return { ok: false, code: 1, message: `不安全的安装目标被拒绝（${unsafe}）: ${JSON.stringify(arg)}` }
+  }
+  const ascii = kind === 'file' ? assertAsciiFileTarget(arg) : null
+  if (ascii !== null) {
+    return { ok: false, code: 1, message: ascii }
   }
   const args = ['add', arg, '--reporter=ndjson']
   // 热装默认关闭 auto-install-peers：避免 pnpm 自动把插件声明的官方业务 peer 拉进 profile

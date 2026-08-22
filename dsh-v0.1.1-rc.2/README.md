@@ -221,6 +221,8 @@ pnpm build       # tsc 编译 host 到 lib/ + tsdown 打包 client 到 lib/clien
 - [x] 转正跳过官方业务 peer：官方 `@deepseek-ai/dsh-*` 由发行内嵌提供，不装进 profile、不回收入闭包（P-042）
 - [x] 官方系统依赖统一白名单：`isOfficialSystemDep`（含 `@deepseek-ai/cordis`、`@deepseek-ai/schemastery`）集中真源，热装/转正/卸载全链路复用，官方包不进 profile（P-045）
 - [x] profile 收敛：清除 `dsh-plugins` 聚合残留与本地 `@deepseek-ai/cordis`，deps 仅留真身；验证 peer cordis 由发行内嵌 resolve（P-046）
+- [x] 只走官方 pnpm：取指栈改为「corepack 精确缓存 → 官方裸命令 `pnpm`（PATH）→ desktop 捆绑仅末位」，纯官方环境完整可运行、desktop 仅适配（P-047）
+- [x] file: 安装 ASCII 前置校验：目标含非 ASCII 目录时明确中文提示拦截，替代 pnpm 晦涩截断错误；ASCII/registry 照常放行（P-048）
 - [x] 重载界面：一键重载 CLIENT 层，让热加载插件 client 卡片显现（无需整壳重启）
 - [x] 卸载完整清除：移除磁盘包（含孤儿目录强删）+ 依赖闭包 + 装配登记 + 自持数据
 
