@@ -17,3 +17,6 @@ typecheck-tmp/node_modules/
 .DS_Store
 Thumbs.db
 *.log
+
+# smoke 测试临时目录（不入库）
+.smoketmp/
