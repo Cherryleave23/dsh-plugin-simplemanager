@@ -181,6 +181,8 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const [dirLevel, setDirLevel] = useState<DirLevel | null>(null)
   /** 目录选择弹窗是否打开（改造1：从内联改为独立弹层）。 */
   const [dirPickerOpen, setDirPickerOpen] = useState(false)
+  /** 重载前预检发现风险时的确认弹窗（report=展示文本，resolve=用户是否仍要重载）。 */
+  const [riskAsk, setRiskAsk] = useState<{ report: string; resolve: (v: boolean) => void } | null>(null)
   /** 插件搜索关键词（改造3：匹配重命名名 alias / 原名 name）。 */
   const [query, setQuery] = useState('')
   /** 当前拖拽悬停的落点 key（"folder:<id>" / "plugin:<name>"），用于落点高亮显示（改造2）。 */
@@ -288,6 +290,18 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
       notify('日志复制失败：浏览器限制了剪贴板访问')
     }
     document.body.removeChild(ta)
+  }
+
+  /** 复制预检风险报告到剪贴板（复用日志兜底逻辑），组内做提示。 */
+  const copyRiskReport = (text: string): void => {
+    const done = (): void => notify('已复制预检报告，可粘贴到插件处修改')
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        void navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done))
+        return
+      }
+    } catch { /* 走 fallback */ }
+    fallbackCopy(text, done)
   }
 
   const clearLogs = (): void => {
@@ -544,9 +558,10 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     const warnMsg =
       `重载界面前预检发现 ${bad.length} 个插件的 client 在刷新渲染进程时可能崩溃\n` +
       `（静态存在性检查拦不住这类运行时错误，故在重载前先逐层执行冒烟验证）：\n\n` +
-      `${detail}\n\n` +
-      `仍要重载界面吗？会按原样刷新渲染进程；建议先修复上述插件再重载。`
-    if (!window.confirm(warnMsg)) return
+      `${detail}`
+    // 应用内弹窗确认（而非 window.confirm）：提供「复制报告」一键拷贝，便于去插件处定位修改。
+    const proceed = await new Promise<boolean>((resolve) => setRiskAsk({ report: warnMsg, resolve }))
+    if (!proceed) return
     pushLog('info', '用户选择继续：仍按原样重载界面')
     window.location.reload()
   }
@@ -1017,6 +1032,38 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
             >
               {dirLevel?.roots ? '加载当前目录' : `加载当前目录：${browsePath ?? '（尚未选择）'}`}
             </button>
+          </div>
+        </div>
+      )}
+      {riskAsk && (
+        <div style={s.modalMask} onClick={() => { riskAsk.resolve(false); setRiskAsk(null) }}>
+          <div style={{ ...s.modalPanel, maxWidth: 600 }} onClick={(e) => e.stopPropagation()}>
+            <div style={s.modalHead}>
+              <span style={s.modalTitle}>{'⚠ 重载前预检发现风险'}</span>
+              <button style={s.iconBtnSm} title="取消（不重载）" onClick={() => { riskAsk.resolve(false); setRiskAsk(null) }}>{'✕'}</button>
+            </div>
+            <div
+              style={{
+                fontSize: 12,
+                margin: '12px 0',
+                padding: 10,
+                borderRadius: 6,
+                background: 'var(--dsw-alias-bg-mask)',
+                color: 'var(--dsw-alias-label-secondary)',
+                whiteSpace: 'pre-wrap',
+                lineHeight: 1.6,
+                maxHeight: 240,
+                overflow: 'auto',
+              }}
+            >
+              {riskAsk.report}
+            </div>
+            <div style={s.tempRow}>
+              <button style={s.ghostBtn} onClick={() => copyRiskReport(riskAsk.report)} title="复制完整预检报告到剪贴板，方便去插件处定位修改">{'⧉ 复制报告'}</button>
+              <div style={{ flex: 1 }} />
+              <button style={s.ghostBtn} onClick={() => { riskAsk.resolve(false); setRiskAsk(null) }}>{'取消'}</button>
+              <button style={s.primaryBtn} onClick={() => { riskAsk.resolve(true); setRiskAsk(null) }} title="仍按原样刷新渲染进程，可先复制报告去修复">{'仍要重载'}</button>
+            </div>
           </div>
         </div>
       )}
