@@ -270,6 +270,13 @@ export class SimpleManagerHost {
     return null
   }
 
+  // ---- 装配层写面 · 判据6 收敛注记（已知脆弱，见 MANIFEST「不许碰清单」） ----
+  // 运行时装配效果一律走官方服务（ctx.loader.update/remove，见 index.ts）；本集群为跨重启持久化 /
+  // 装配清单清理的必要兜底。直写的是官方装配器产生的同格式文件（cordis.patch.yml / cordis.yml /
+  // profile package.json bundles），但格式属 loader 内部状态、非公共契约——内核/桌面壳改动格式时此处
+  // 正则/清单编辑可能失效。升级适配时先对照 MANIFEST「不许碰清单」对消费面 diff：
+  //   官方替代 = `dsh plugin remove` / 桌面壳 `desktopPnpm` 等装配持久化入口；
+  //   保留此直写的原因 = 插件要求宿主不可知、只消费 dsh 内核，官方 in-kernel JS API 尚无通用范式。
   // ---- 全局层补丁（cordis.patch.yml）启停 ----
   readPatchEnabledIds(): Set<string> {
     if (!existsSync(this.patchFile)) return new Set()
@@ -291,6 +298,7 @@ export class SimpleManagerHost {
    * （不依赖桌面壳注入服务），故以官方装配器同格式落盘；装配行为与官方命令一致，重启由同一 loader 装配。
    *
    * 写前先备份，write 采用原子写（临时文件 + rename）。返回是否发生了实际变更（已存在/已移除同一 id 时为 false）。
+   * @known-fragile 装配层内部文件直写（见 MANIFEST「不许碰清单」），同格式但非公共契约。
    */
   setPatchEnabled(id: string, name: string, enabled: boolean): boolean {
     if (!existsSync(this.patchFile)) return false
@@ -303,7 +311,8 @@ export class SimpleManagerHost {
   }
 
   /** 从 profile package.json 的 `dsh.profile.bundles` 装配清单移除包名（官方 `dsh plugin add` 登记处）。
-   * 避免卸载后重启时桌面壳仍尝试装配已删除的包而报 `cannot resolve package`。返回是否发生实际变更。 */
+   * 避免卸载后重启时桌面壳仍尝试装配已删除的包而报 `cannot resolve package`。返回是否发生实际变更。
+   * @known-fragile 装配清单直写（见 MANIFEST「不许碰清单」），其 schema 非公共契约。 */
   removeBundle(packageName: string): boolean {
     const manifestPath = join(this.profileDir, 'package.json')
     if (!existsSync(manifestPath)) return false
@@ -324,7 +333,8 @@ export class SimpleManagerHost {
    * 登记的顶层序列项）。与 patch 层（cordis.patch.yml）/ package.json bundles 不同：官方 bundle 插件
    * （含自装第三方）的启用装配登记在 `cordis.yml`——卸载若不清这层，重启后 loader 仍装配该 entry，
    * buildCatalog 经 `assembledModuleNames` 继续收拢它，插件就会残留在列表且仍可启停（P-038/P-039）。
-   * `cordis.yml` 是规整的顶层数组（块起点为无缩进的 `- `，子字段 2 空格缩进），按块精确移除目标。返回是否发生实际变更。 */
+   * `cordis.yml` 是规整的顶层数组（块起点为无缩进的 `- `，子字段 2 空格缩进），按块精确移除目标。返回是否发生实际变更。
+   * @known-fragile 装配清单直写（见 MANIFEST「不许碰清单」），格式非公共契约。 */
   removeBundleEntry(packageName: string): boolean {
     const file = join(this.profileDir, 'cordis.yml')
     if (!existsSync(file)) return false
