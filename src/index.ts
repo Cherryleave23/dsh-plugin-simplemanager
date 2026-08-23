@@ -11,9 +11,11 @@
  *   - note / rename / scope ：插件备注 / 显示名 / 作用域覆盖
  */
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
-import { existsSync, readFileSync, rmSync } from 'node:fs'
+import { basename, isAbsolute, join, normalize } from 'node:path'
+import { existsSync, readFileSync, rmSync, statSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
+import vm from 'node:vm'
+import { createRequire } from 'node:module'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   SimpleManagerHost,
@@ -408,28 +410,79 @@ export function apply(ctx: AppContext): void {
             return send({ ok: true, ...buildView() })
           }
 
+          if (action === 'verifyClient') {
+            // 刷新界面前的 client 无头冒烟预检：在 kernel 进程真实执行各插件 client bundle（load 注册 + apply），
+            // 提前发现「热注入没问题、但重载前端就崩」的插件，并给出分步根因。不依赖桌面渲染端是否在跑。
+            const body = await readJsonBody(req)
+            const raw = body.names
+            const names = Array.isArray(raw) ? raw.filter((n): n is string => typeof n === 'string' && n.trim() !== '') : []
+            const profileDir = host?.profileDir ?? undefined
+            const results = names.map((n) => clientSmokeTest(n, locateClientRoots(n, profileDir), profileDir))
+            return send({ ok: true, results })
+          }
+
           if (action === 'toggle') {
             const body = await readJsonBody(req)
             const id = typeof body.id === 'string' ? body.id : ''
             if (!id) return fail('缺少插件 id')
             const bundle = buildCatalog(ctx, host).find((b) => b.name === id)
             if (!bundle) return fail('插件不存在: ' + id)
+
             const patchEnabled = host.readPatchEnabledIds()
             const live = loaderLiveMap(ctx).get(id)
-            const next = live === undefined ? !patchEnabled.has(id) : !live.enabled
-            // 持久化装配层：仍写 profile patch（insert 增删），保证重启后装配状态正确。
-            host.setPatchEnabled(id, id, next)
-            // 运行时热启停：对已装配 entry 做 update({ disabled }) 立即生效（非 reload，reload 不具备）。
-            // 停=dispose 保留条目；启=重新启动 fiber。找不到运行 entry（未装配）则仅落盘、走重启装配。
+            // 当前启停态：运行时（loader/pluginInventory 权威，含 disabled 条目）为准；无运行态回落 patch 登记。
+            const currentlyEnabled = live === undefined ? patchEnabled.has(id) : live.enabled
+            const next = !currentlyEnabled
+
+            // —— 持久化装配层（判据6 收敛，见 MANIFEST「不许碰清单」）——
+            // 决定持久装配面（写不写 patch）：
+            //   - bundle 层插件（官方 `dsh plugin add` 装配进 cordis.yml / bundles）→ 永不写 patch，
+            //     重启由该层恢复；如有旧版误写进 patch 的条目则清掉，防 duplicate loader entry id；
+            //   - 会话临时插件（tempLoad，重启即消失）→ 不写 patch，toggle 仅运行时；
+            //   - 其余（promote 转正 / 持久安装的第三方）→ patch 即本面板持久装配面，启/停都写 patch。
+            // 若以 `patchEnabled.has(id)` 判断会漏掉「曾被停用、已不在 patch 集合」的 patch 插件（光有停没有起）。
+            const bundleMerged = host.isBundleAssembled(id)
+            const isSessionTemp = tempInfos.has(id)
+            const patchWritable = !bundleMerged && !isSessionTemp
+            if (patchWritable) {
+              host.setPatchEnabled(id, id, next)
+            } else if (bundleMerged && patchEnabled.has(id)) {
+              host.setPatchEnabled(id, id, false) // 清理旧版误写进 patch 的 bundle 条目
+            }
+
+            // —— 运行时热启停 ——
+            // 停用后的 entry 仍留在 loader 树（disabled、fiber 置空），用 update({disabled:false}) 即可重新启动 fiber；
+            // 树里已无该 entry（如装配文件重载被移除）则对非 bundle 插件用 create 热装，避免运行时装配被跳过。
             let hotApplied = false
-            if (live?.entryId) {
+            const entryId = live?.entryId ?? findLoaderEntryId(ctx, id)
+            if (next) {
+              if (entryId) {
+                try {
+                  if (typeof ctx.loader.update === 'function') {
+                    await ctx.loader.update(entryId, { disabled: false })
+                    hotApplied = true
+                  }
+                } catch {
+                  hotApplied = false // 运行时重启失败，落盘已生效，走重启生效
+                }
+              } else if (!bundleMerged && typeof ctx.loader.create === 'function') {
+                try {
+                  // 装配表里没有该 entry → 官方 create 热装配；persistable 则补写 patch，重启保持一致。
+                  await ctx.loader.create({ name: id, config: {}, disabled: false })
+                  if (patchWritable && !patchEnabled.has(id)) host.setPatchEnabled(id, id, true)
+                  hotApplied = true
+                } catch {
+                  hotApplied = false // 运行时热装失败，落盘/patch 已生效，走重启生效
+                }
+              }
+            } else if (entryId) {
               try {
                 if (typeof ctx.loader.update === 'function') {
-                  await ctx.loader.update(live.entryId, { disabled: !next })
+                  await ctx.loader.update(entryId, { disabled: true })
                   hotApplied = true
                 }
               } catch {
-                hotApplied = false // 运行时更新失败，落盘已生效，走重启生效
+                hotApplied = false // 运行时停用失败，落盘已生效，走重启生效
               }
             }
             return send({ ok: true, enabled: next, hotApplied, ...buildView() })
@@ -686,6 +739,23 @@ function assembledModuleNames(ctx: AppContext): Set<string> {
   return names
 }
 
+/**
+ * 在 loader 装配树里按 moduleName 查找首个非 group 的 entry id。
+ * 直接遍历 `ctx.loader.entries()`（含 disabled、fiber 为 undefined 的条目，见 loader tree.entries()），
+ * 不依赖 pluginInventory（其返回的 entryId 与 entry.id 恒等，但个别宿主可能过滤 disabled），
+ * 供启停时精确定位已装配 entry（停用后仍留在树中，启用时 `update({disabled:false})` 即可重启 fiber）。
+ */
+function findLoaderEntryId(ctx: AppContext, moduleName: string): string | undefined {
+  try {
+    for (const entry of ctx.loader.entries()) {
+      if (entry?.options?.name === moduleName && !entry.options.group) return entry.id
+    }
+  } catch {
+    /* ignore */
+  }
+  return undefined
+}
+
 /** 数组内移动：delta=-1 上移、+1 下移，越界则原位不动。返回 indexOf 目标位置。 */
 function moveIn(arr: string[], index: number, delta: number): number {
   const j = index + delta
@@ -910,7 +980,9 @@ async function tempLoad(
     finishRun(run)
   }
 
-  // 1) 真实装包 + 拉齐依赖闭包。依赖获取失败如实带回来，不阻塞后续 create 尝试。
+  // 1) 真实装包 + 拉齐依赖闭包。依赖获取失败即中止：不再继续 loader.create，避免把「装一半」的
+  //    半残实例挂进运行内核（依赖未到位 → create 仍可能 apply 成功 → 路由/服务被占、且残留为
+  //    无法回收的幽灵 active 实例，P-036/P-043 实证）。
   let depsApplied = false
   let pnpmReason: string | undefined
   let installedDeps: string[] = []
@@ -923,12 +995,15 @@ async function tempLoad(
     if (!depsApplied) {
       pnpmReason = out.message
       markStep(run, 'deps', 'err', out.message)
-    } else {
-      installedDeps = out.installedDeps ?? []
-      markStep(run, 'deps', 'ok', installedDeps.length > 0 ? `含补装 ${installedDeps.length} 包` : undefined)
+      fail(`依赖安装失败（${pnpmReason}）——失败即中止，未装配插件；请先解决上述依赖后再加载`)
+      throw new Error(`依赖安装失败（${pnpmReason}）`)
     }
+    installedDeps = out.installedDeps ?? []
+    markStep(run, 'deps', 'ok', installedDeps.length > 0 ? `含补装 ${installedDeps.length} 包` : undefined)
   } else {
     markStep(run, 'deps', 'err', 'profileDir 缺失，无法安装依赖')
+    fail('profileDir 缺失，无法安装依赖——失败即中止，未装配插件')
+    throw new Error('profileDir 缺失，无法安装依赖')
   }
 
   // 2) packageName = 插件真实包名（装包后由 package.json 解析，路径/registry 均可）。
@@ -944,13 +1019,35 @@ async function tempLoad(
     appendNote(run, 'warn', `该插件依赖官方业务包 ${officialPeers.join('/')}，桌面对动态热装的官方 peer 解析可能受限`)
   }
 
+  // client 板块前置探测：声明了 client 但产物缺失/为空 → 刷新渲染器会整体导入坏 client 而崩溃（P-041）。
+  // 只做存在性校验并强警告，不阻断宿主侧装配（宿主 entry 与渲染端 client 彼此独立）。
+  const clientArt = detectClientArtifact(locateClientRoots(packageName, host?.profileDir ?? undefined))
+  if (clientArt.declared) {
+    if (clientArt.artifactExists && clientArt.artifactSize > 0) {
+      appendNote(run, 'info', `该插件带 client 板块（web），渲染端刷新时将按装配框架整体导入它；client 资产已就绪（${clientArt.artifactSize}B）`)
+    } else {
+      appendNote(run, 'err', `该插件声明了 client 板块，但 client 产物缺失或为空（多为 client 编译错误）：刷新渲染器会整体导入坏 client，导致整页报错需回滚重启。请先修复并重新构建 client 后再刷新；当前仅宿主侧已装配、建议不要刷新界面`)
+    }
+  }
+
   // 3) 运行时热装：create 的 promise resolve = entry 装配/apply 成功；import 或 apply 失败时 reject。
   markStep(run, 'assemble', 'running')
+  // P-043 失败清理基准：create 前既有 entry id。create 抛错后按包名再探一次，凡本次新出现的半挂 entry
+  // 一律拆掉（apply 失败的重叠实例会占用路由/服务/资源），既有健康实例（装前已存在）保持不动，避免误杀。
+  let entryIdBeforeCreate: string | undefined
+  try { entryIdBeforeCreate = findLoaderEntryId(ctx, packageName) } catch { /* ignore */ }
   let entryId: string
   try {
     entryId = await ctx.loader.create({ name: packageName, config: {}, disabled: false })
     markStep(run, 'assemble', 'ok')
   } catch (error) {
+    try {
+      const staleId = findLoaderEntryId(ctx, packageName)
+      if (typeof staleId === 'string' && staleId !== entryIdBeforeCreate && typeof ctx.loader.remove === 'function') {
+        await ctx.loader.remove(staleId).catch(() => {})
+        appendNote(run, 'warn', `已清理本次装配失败的半挂 entry ${staleId}`)
+      }
+    } catch { /* 清理尽力而为 */ }
     // 官方 loader 对 apply/import 错会用 { cause } 包装（failed to apply loader entry <id> (<name>): …），
     // 剥 cause 链取最底层 message 才是插件自身的根因；两者不同时并列保留 loader 上下文便于定位。
     let root: unknown = error
@@ -992,6 +1089,10 @@ async function tempLoad(
   markStep(run, 'finish', 'running')
   tempInfos.set(packageName, { entryId, spec: name, installedDeps })
   host?.pushHotInstall(packageName)
+  // 热装 = 重新安装该插件：清掉本会话的「已卸载待重启」残留标记，否则 buildView 的 residual 仍为 true，
+  // 把已在运行的插件误标成「已卸载、不可启停」（P-040 卸载后再热装状态矛盾）。注意不能靠「live 是否命中」判断——
+  // 「卸载但装配未拆干净、待重启消失」的插件一样 live 命中，那正是要显示「已卸载待重启」的场合，故须显式删除。
+  recentlyUninstalled.delete(packageName)
   markStep(run, 'finish', 'ok', state ?? 'active')
   finishRun(run)
   return { depsApplied, pnpmReason, hotApplied: true, packageName, entryId, state, officialPeers, runId }
@@ -1014,6 +1115,274 @@ function detectOfficialPeerDeps(packageName: string, profileDir?: string): strin
   }
 }
 
+/** 计算某插件 client 产物可能所在目录（优先级：temp 源目录 → profile node_modules）。
+ * 热装插件（tempInfos 有 spec 源路径）常从任意目录临时加载、并不落在 profile node_modules，需按源目录定位。 */
+function locateClientRoots(packageName: string, profileDir?: string): string[] {
+  const roots: string[] = []
+  const info = tempInfos.get(packageName)
+  if (info?.spec) {
+    const raw = info.spec.replace(/^file:/i, '')
+    // 形似路径（含分隔符 / 盘符 / 相对前缀）才作候选；纯 name@ver 为 registry 安装，退回 profile node_modules。
+    if (/[\\/]/.test(raw) || /^[A-Za-z]:/.test(raw) || raw.startsWith('.')) {
+      roots.push(normalize(isAbsolute(raw) ? raw : join(process.cwd(), raw)))
+    }
+  }
+  if (profileDir) roots.push(join(profileDir, 'node_modules', packageName))
+  return roots
+}
+
+/** 在候选目录里找某插件是否声明 client 板块并定位其产物（声明缺失目录 / 无 package.json 的目录按序跳过）。 */
+function detectClientArtifact(candidateRoots: string[]): { declared: boolean; artifactExists: boolean; artifactSize: number; path?: string } {
+  const none = { declared: false, artifactExists: false, artifactSize: 0 }
+  for (const root of candidateRoots) {
+    const manifestPath = join(root, 'package.json')
+    if (!existsSync(manifestPath)) continue
+    try {
+      const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as {
+        dsh?: { client?: unknown }
+        exports?: Record<string, unknown>
+      }
+      // 判定是否声明 client 板块：dsh.client 存在，或 exports 里有 "./client" 导出。
+      const declared = Boolean(manifest.dsh?.client) || Boolean(manifest.exports?.['./client'])
+      if (!declared) return none
+      // 解析 "./client" 的相对入口（默认 field），退化到常见目录。
+      const exp = manifest.exports?.['./client'] as { default?: string } | string | undefined
+      const rel = typeof exp === 'string' ? exp : typeof exp === 'object' && exp ? (exp as { default?: string }).default : undefined
+      const candidates = rel
+        ? [rel]
+        : ['./lib/client.js', './client.js', './src/client/index.tsx']
+      for (const c of candidates) {
+        const p = join(root, ...c.replace(/^\.\//, '').split('/'))
+        if (existsSync(p)) {
+          try { return { declared, artifactExists: true, artifactSize: statSync(p).size, path: p } } catch { return { declared, artifactExists: true, artifactSize: 0, path: p } }
+        }
+      }
+      return { declared, artifactExists: false, artifactSize: 0 }
+    } catch {
+      return none
+    }
+  }
+  return none
+}
+
+// ---------------------------------------------------------------------------
+// client 板块「无头冒烟预检」引擎
+//
+// 目标：在运行前（不依赖桌面渲染端是否在跑）可感知地发现「热注入没问题、但重载前端就崩」的插件。
+// 原理：直接在 Node/kernel 进程里用 node:vm 真实执行该插件已装入的 client bundle——
+//   ① load 注册（window.__ModuleLoader__.load 是否按契约注册 entry）
+//   ② factory 物化 + apply(ctx) 挂载（apply 抛错即「重载前端崩」的反面根因）
+// 任一环抛错即返回带分步原因的诊断，供刷新界面预检 / 热装源头提示。
+//
+// 已知边界（演进方向，见文档「不许碰清单」与 ANALYSIS §…）：
+//   - 不真正挂载渲染组件（需 react-dom + 真实 DOM 才会触发的 useState-of-null / dual-react 类渲染崩，
+//     后续可加「SSR 渲染层」抓取，react-dom 自 profile 可解析时启用）；
+//   - 官方 dsh 运行时（@deepseek-ai/dsh-client-runtime、dsh-client-ui-slots 等）在预检沙箱以「惰性代理」
+//     模拟，真实桌面会注入；故依赖官方钩子用法的错误不会被虚假命中（也暂不能抓）。
+// ---------------------------------------------------------------------------
+interface SmokeStepOutcome { name: string; ok: boolean; detail: string }
+interface ClientSmokeReport {
+  name: string
+  declared: boolean
+  ok: boolean
+  steps: SmokeStepOutcome[]
+  /** 顶层失败原因（steps 里亦有对应 err 步）。 */
+  error?: string
+}
+
+function smokeErrToString(error: unknown, max = 400): string {
+  if (!(error instanceof Error)) return String(error)
+  const msg = error.stack ? `${error.message}\n${error.stack.split('\n').slice(1, 5).join('\n')}` : error.message
+  return msg.length > max ? msg.slice(0, max) + '…' : msg
+}
+
+/** 渲染探测里区分「组件自身 bug」与「无头环境缺浏览器 API」：后者不算插件问题，中性跳过。 */
+function isBrowserEnvError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error)
+  return /window|document|navigator|localStorage|sessionStorage|location|history|HTMLElement|Element is not defined/i.test(msg)
+}
+
+/** 惰性递归代理：任何 get/调用/构造都返回自身，供「真实桌面注入、本沙箱没有」的官方依赖占位。 */
+function recProxy(): any {
+  const fn = function (): any { return recProxy() }
+  return new Proxy(fn, {
+    get: (_t, prop) => (prop === Symbol.toPrimitive ? () => '' : recProxy()),
+    apply: () => recProxy(),
+    construct: () => recProxy(),
+    getPrototypeOf: () => Object.prototype,
+  })
+}
+
+/** 构建模块加载沙箱：window 挂 __ModuleLoader__，另给常见浏览器全局一个宽容代理，避免顶层 DOM 访问误报。 */
+function buildClientSandbox(fakeWindow: Record<string, unknown>): Record<string, unknown> {
+  const tolerant = new Proxy({}, {
+    get: (_t, prop) => (prop === Symbol.toPrimitive ? () => '' : recProxy()),
+  })
+  const win = fakeWindow as Record<string, unknown>
+  const sandbox: Record<string, unknown> = {
+    window: win,
+    globalThis: win,
+    self: win,
+    console,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval,
+    fetch,
+    document: tolerant,
+    navigator: tolerant,
+    location: tolerant,
+    localStorage: tolerant,
+    sessionStorage: tolerant,
+    history: tolerant,
+  }
+  sandbox.global = win
+  return sandbox
+}
+
+/** 从目标 profile 目录构建 require，供渲染探测解析真实 react / react-dom（与实际渲染端同源）；失败返回 null。 */
+function makeProfileRequire(profileDir?: string): ((id: string) => unknown) | null {
+  if (!profileDir) return null
+  try { return createRequire(join(profileDir, 'package.json')) } catch { return null }
+}
+
+/** factory 的 require 实现：react 尽量解析真实包，缺失则退最小 shim；官方 dsh 运行时以惰性代理模拟。 */
+function makeClientRequireShim(profileDir: string, packageName: string, steps: SmokeStepOutcome[]): (id: string) => unknown {
+  let baseReq: ((id: string) => unknown) | null = null
+  try { baseReq = createRequire(join(profileDir, 'package.json')) } catch { baseReq = null }
+  let react: { version?: string; createElement?: unknown; Fragment?: unknown } | undefined
+  if (baseReq) { try { react = baseReq('react') as never } catch { react = undefined } }
+  const jsxRuntime = react
+    ? { jsx: (react as { createElement: unknown }).createElement, jsxs: (react as { createElement: unknown }).createElement, Fragment: react.Fragment }
+    : { jsx: (type: unknown, props: unknown, ...kids: unknown[]) => ({ type, props: { ...(props as object), children: kids } }), jsxs: (type: unknown, props: unknown) => ({ type, props }), Fragment: Symbol('fixture-fragment') }
+  const seenUnknown = new Set<string>()
+  return (id: string): unknown => {
+    if (id === 'react') { steps.push({ name: 'require', ok: true, detail: `resolve "${id}" → ${react?.version ? 'react@' + react.version : '最小 shim'}` }); return react ?? jsxRuntime }
+    if (id === 'react/jsx-runtime' || id === 'react/jsx-dev-runtime') { steps.push({ name: 'require', ok: true, detail: `resolve "${id}" → ${react ? 'react 驱动 jsx shim' : '最小 shim'}` }); return jsxRuntime }
+    if (baseReq) {
+      try { return baseReq(id) } catch { /* 未解析，走下方惰性占位 */ }
+    }
+    if (id.startsWith('@deepseek-ai/') && !seenUnknown.has(id)) {
+      seenUnknown.add(id)
+      steps.push({ name: 'require', ok: true, detail: `依赖 "${id}" 在预检沙箱以惰性代理模拟（真实桌面由渲染端注入）` })
+    }
+    return recProxy()
+  }
+}
+
+/** 无头冒烟预检一个插件的 client bundle（两层：load 注册 + factory/apply）。不依赖桌面渲染端是否在跑。 */
+function clientSmokeTest(packageName: string, candidateRoots: string[], profileDir?: string): ClientSmokeReport {
+  const steps: SmokeStepOutcome[] = []
+  const record = (name: string, ok: boolean, detail: string): void => { steps.push({ name, ok, detail }) }
+  const settle = (declared: boolean, ok: boolean, error?: string): ClientSmokeReport => ({ name: packageName, declared, ok, steps, error })
+
+  if (candidateRoots.length === 0) return settle(false, false, '缺少可定位的目录，无法找 client 产物')
+  const artifact = detectClientArtifact(candidateRoots)
+  if (!artifact.declared) { record('locate', true, '未声明 client 板块，跳过预检'); return settle(false, true) }
+  if (!artifact.path || !artifact.artifactExists || artifact.artifactSize <= 0) {
+    record('locate', false, `声明了 client 板块，但产物缺失或为空（多为 client 编译错误）`)
+    return settle(true, false, 'client 产物缺失或为空')
+  }
+
+  // ① 读取 + 求值（load 注册）
+  let code: string
+  try { code = readFileSync(artifact.path, 'utf8') } catch (error) { record('read', false, `读取 client 产物失败：${smokeErrToString(error)}`); return settle(true, false, '读取 client 产物失败') }
+  record('read', true, `产物已读取（${artifact.artifactSize}B）：${basename(artifact.path)}`)
+  const fakeWindow: Record<string, unknown> = {
+    __ModuleLoader__: { mode: 'queue', pendingQueue: [] as unknown[], load(reg: unknown): void { (this.pendingQueue as unknown[]).push(reg) } },
+  }
+  const sandbox = buildClientSandbox(fakeWindow)
+  try {
+    vm.runInNewContext(code, sandbox, { filename: artifact.path })
+  } catch (error) {
+    record('load', false, `模块求值抛错：${smokeErrToString(error)}`)
+    return settle(true, false, `模块求值抛错：${smokeErrToString(error, 200)}`)
+  }
+  record('load', true, 'client bundle 求值成功（无顶层抛错）')
+  const pending = ((fakeWindow.__ModuleLoader__ as { pendingQueue: unknown[] }).pendingQueue) ?? []
+  const registration = pending[0] as { id?: string; factory?: unknown } | undefined
+  if (pending.length !== 1 || typeof registration?.factory !== 'function') {
+    record('register', false, `期望恰好一次 load 注册，实得 ${pending.length} 次（id=${registration?.id ?? '?'}）`)
+    return settle(true, false, 'client 未按装配契约注册（load 次数/工厂形态不符）')
+  }
+  record('register', true, `已注册 client entry id="${registration.id}"（factory 为函数）`)
+
+  // ② factory 物化 + 导出形状
+  let materialized: unknown
+  try { materialized = registration.factory(makeClientRequireShim(profileDir, packageName, steps)) } catch (error) {
+    record('materialize', false, `factory 物化抛错：${smokeErrToString(error)}`)
+    return settle(true, false, `factory 物化抛错：${smokeErrToString(error, 200)}`)
+  }
+  record('materialize', true, 'factory 物化成功（导出面可读）')
+  const exportsObj = materialized as { apply?: unknown; inject?: unknown } | undefined
+  if (typeof exportsObj?.apply !== 'function') {
+    record('shape', false, `未导出 apply 函数（实得 ${typeof exportsObj?.apply}）`)
+    return settle(true, false, 'client 未导出 apply 函数')
+  }
+  const inject = exportsObj.inject as string[] | undefined
+  record('shape', true, `导出 apply + inject=${Array.isArray(inject) ? '[' + inject.join(',') + ']' : '（无）'}`)
+
+  // ③ apply(ctx)：两层核心，apply 抛错=「重载前端时」的根因
+  const slotCount = { n: 0 }
+  const totalSlots = { n: 0 }
+  void slotCount; void totalSlots
+  const renderTargets: Array<{ name: string; comp: unknown }> = []
+  const mockCtx: Record<string, unknown> = {
+    slots: {
+      inject: (_name: string, cb: unknown) => { slotCount.n++; return typeof cb === 'function' ? { unregister(): void {} } : undefined },
+      register: (opts: { id?: string; name?: string }, comp: unknown) => {
+        totalSlots.n++
+        if (typeof comp === 'function') renderTargets.push({ name: opts?.name ?? opts?.id ?? '?', comp })
+        return { unregister(): void {} }
+      },
+    },
+    effect: (fn: unknown) => { const d = (fn as () => unknown)(); return typeof d === 'function' ? d : () => {} },
+    on: () => () => {},
+  }
+  try {
+    exportsObj.apply(mockCtx)
+  } catch (error) {
+    record('apply', false, `apply(ctx) 抛错 —— 重载前端时的根因：${smokeErrToString(error)}`)
+    return settle(true, false, `apply(ctx) 抛错：${smokeErrToString(error, 200)}`)
+  }
+  record('apply', true, `apply(ctx) 成功执行${slotCount.n + totalSlots.n > 0 ? `，注册了 ${slotCount.n + totalSlots.n} 处界面 slot` : '（未注册任何 slot，可能无界面贡献）'}`)
+
+  // ③.5 渲染挂载探测：把 apply 注册进 slots 的组件，用宿主真实 react-dom/server 渲染一遍。
+  // 抓「渲染期空指针 / 组件自身崩溃」——这是真实「重载前端时白屏/报错」最常见的一类（渲染才触发、
+  // apply 同步不触发），单凭前两步漏检。react-dom 从目标 profile 解析，与实际渲染端同源。
+  const renderBaseReq = makeProfileRequire(profileDir)
+  if (renderTargets.length > 0) {
+    let renderServer: { renderToStaticMarkup?: (node: unknown) => string } | undefined
+    if (renderBaseReq) { try { renderServer = renderBaseReq('react-dom/server') as never } catch { renderServer = undefined } }
+    let reactCt: { createElement?: unknown } | undefined
+    if (renderBaseReq) { try { reactCt = renderBaseReq('react') as never } catch { reactCt = undefined } }
+    if (!renderServer || typeof renderServer.renderToStaticMarkup !== 'function' || !reactCt || typeof reactCt.createElement !== 'function') {
+      record('render', true, `共捕获 ${renderTargets.length} 个界面组件，但预检沙箱从 profile 解析不到 react-dom/server（跳过渲染探测）`)
+    } else {
+      let rendered = 0
+      let skipped = 0
+      let broken: { name: string; detail: string } | null = null
+      for (const t of renderTargets) {
+        if (typeof t.comp !== 'function') continue
+        try { (renderServer.renderToStaticMarkup as (n: unknown) => string)((reactCt.createElement as (c: unknown) => unknown)(t.comp)); rendered++ } catch (error) {
+          if (isBrowserEnvError(error)) { skipped++; record('render', true, `组件 "${t.name}" 渲染依赖浏览器 API（无头环境缺 ${error instanceof Error ? error.message : ''}），中性跳过`); continue }
+          broken = { name: t.name, detail: smokeErrToString(error) }
+          break
+        }
+      }
+      if (broken) {
+        record('render', false, `组件 "${broken.name}" 真实挂载渲染时崩溃——重载前端白屏/报错的直接根因：${broken.detail}`)
+        return settle(true, false, `组件「${broken.name}」渲染挂载崩：${broken.detail.slice(0, 200)}`)
+      }
+      record('render', true, `用宿主 react-dom 渲染 ${rendered}/${renderTargets.length} 个注册组件（${skipped > 0 ? `${skipped} 个需浏览器 API 已中性跳过` : '均无渲染期崩溃'}）`)
+    }
+  } else {
+    record('render', true, 'apply 未向 slots 注册组件，跳过渲染探测')
+  }
+
+  return settle(true, true)
+}
+
 /** 卸载一只临时插件（只接受本面板临时 create 过的 entry）。顺带回收本次临时加载补装的闭包依赖：
  * 仅当该依赖不再被其他活跃临时插件引用时才 `pnpm remove`（引用计数），保证依赖闭包随装卸完整进退。 */
 async function tempRemove(ctx: AppContext, host: SimpleManagerHost | null, name: string, runId: string): Promise<{ runId: string }> {
@@ -1025,6 +1394,13 @@ async function tempRemove(ctx: AppContext, host: SimpleManagerHost | null, name:
   if (!info) { fail(`「${name}」不是本面板临时加载的插件，不能从这里卸载`); throw new Error(`「${name}」不是本面板临时加载的插件，不能从这里卸载`) }
 
   markStep(run, 'unload', 'running')
+  // P-044 先在运行时断开再物理移出：update({disabled:true}) 会联动卸载该 entry 已装入宿主/注入的服务
+  // （含 webserver/SessionPointerResolver 等按 scope 注册的资源），随后再 loader.remove 移出装配树。
+  // 仅 remove 一删了之时，已注册的 webserver 路由（如 prefix /api/recorder）不会随 entry 解绑，
+  // 致同类插件「热装→X卸载→热装」稳定撞 duplicate prefix route（实测 100% 复现）。
+  if (typeof ctx.loader.update === 'function') {
+    try { await ctx.loader.update(info.entryId, { disabled: true }) } catch { /* 尽力而为，不阻断卸载 */ }
+  }
   await ctx.loader.remove(info.entryId)
   markStep(run, 'unload', 'ok')
   tempInfos.delete(name)

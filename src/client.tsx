@@ -100,6 +100,17 @@ async function browse(): Promise<Browse> {
   return await api<Browse>(`${API}/browse`)
 }
 
+/** client 无头冒烟预检：单步结果（load 注册 / apply 等），ok=false 的那步即重载崩溃根因。 */
+interface SmokeStepOutcome { name: string; ok: boolean; detail: string }
+/** client 无头冒烟预检：单个插件的整体结论（declared=true 且 ok=false ⇒ 该插件重载前端时可能崩）。 */
+interface ClientSmokeReport {
+  name: string
+  declared: boolean
+  ok: boolean
+  steps: SmokeStepOutcome[]
+  error?: string
+}
+
 /** 目录浏览层级（官方 directoryPicker.list 返回面）。 */
 interface DirLevel {
   path: string
@@ -119,11 +130,6 @@ async function listdir(path?: string): Promise<{ ok: boolean; level?: DirLevel; 
   })
 }
 
-/** 拖拽某元素到列表中的落点：返回插入后的下标。居中判定 → 插入于目标之后。 */
-function dropIndex(target: number, dragged: number): number {
-  return target > dragged ? target : target + 1
-}
-
 export function apply(ctx: AppClientContext): void {
   // 作为设置里的独立板块呈现（设置 → 桌面管家）：
   // 用官方 settings.section slot（list scope=root），在设置导航列生成独立入口，
@@ -134,7 +140,7 @@ export function apply(ctx: AppClientContext): void {
         name: 'settings.section',
         id: 'simplemanager',
         order: 15,
-        label: () => '桌面管家',
+        label: () => '插件管家',
         inject: () => ({ hooks: {} }),
       },
       SimpleManagerTab,
@@ -145,6 +151,8 @@ export function apply(ctx: AppClientContext): void {
 /** 模块级拖拽信号（纯命令式，不参与渲染）：来源 id 与类型，供子组件 FolderRow/PluginCard 判定落点行为。 */
 const dragName = { current: '' as string }
 const dragKind = { current: '' as 'plugin' | 'folder' | '' }
+/** 拖拽悬停目标上的落点相位：目标中点前半=插入到其前，后半=插入到其后。 */
+const dragPhase = { current: 'before' as 'before' | 'after' }
 
 function browserDragging(): boolean {
   return dragKind.current !== ''
@@ -177,6 +185,8 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const [query, setQuery] = useState('')
   /** 当前拖拽悬停的落点 key（"folder:<id>" / "plugin:<name>"），用于落点高亮显示（改造2）。 */
   const [hoverTarget, setHoverTarget] = useState('')
+  /** 当前拖拽悬停的落点相位（目标中点前/后），用于插入指示条（改造：拖拽排序放宽）。 */
+  const [dropPhase, setDropPhase] = useState<'before' | 'after' | ''>('')
 
   const refresh = useCallback(async () => {
     const view = await browse()
@@ -475,9 +485,69 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     }, 400)
   }
 
-  /** 重载 CLIENT 层：重新执行渲染进程 boot 注入，让已热装进内核 graph 的插件 client 卡片出现。内核进程与热装状态不受影响。 */
-  const reloadClient = (): void => {
-    if (!window.confirm('重载界面（仅刷新渲染进程，不重启内核）？\n用于让热加载插件的 client 卡片立即出现在界面中。当前会话与内核热装状态都会保留。')) return
+  /** 重载 CLIENT 层前，对「活跃插件」做无头冒烟预检请求（kernel 进程真实执行 client bundle 的 load 注册 + apply）。 */
+  const preflightClients = async (names: string[]): Promise<ClientSmokeReport[]> => {
+    try {
+      const r = await api<{ ok?: boolean; results: ClientSmokeReport[] }>(`${API}/verifyClient`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ names }),
+      })
+      return r.results ?? []
+    } catch {
+      return []
+    }
+  }
+
+  /** 展开一条预检报告的每步详情（1 行 1 步，缩进对齐），ok=false 那步即重载崩根因。 */
+  const renderReportSteps = (r: ClientSmokeReport): string =>
+    r.steps.map((s) => `   ${s.ok ? '✓' : '✗'} ${s.name}：${s.detail}`).join('\n')
+
+  /** 重载 CLIENT 层：先对活跃插件做无头冒烟预检，抓到「热注入没问题、但重载前端会崩」的插件就警告并列分步根因，
+   * 当前策略为「警告 + 仍允许重载」（硬阻止为未来方向）。静态存在性检查拦不住这类运行时错误，只能靠冒烟预检。 */
+  const reloadClient = async (): Promise<void> => {
+    // 重载引导期会重新 apply 的插件都要预检：不仅 active，含引导中(pending/loading)与异常(failed)。
+    // 只预检 active 会漏掉「死在引导期、重载才崩」的高危插件（引擎独立重放 client，对非 active 不误报）。
+    // 排除 @deepseek-ai/* 官方核心：它们由壳以完整浏览器环境原生加载、重载必不崩，而 vm 冒烟沙箱
+    // 缺 URLSearchParams/provide 等环境会对其 apply 产生假阳性，故仅对第三方/自研插件做完整冒烟。
+    const preflightNames = plugins
+      .filter(
+        (p) =>
+          p.state != null &&
+          !p.name.startsWith('@deepseek-ai/') &&
+          ['active', 'pending', 'loading', 'failed'].includes(p.state),
+      )
+      .map((p) => p.name)
+    const base = '重载界面（仅刷新渲染进程，不重启内核）？\n当前会话与内核热装状态都会保留。'
+
+    if (preflightNames.length === 0) {
+      if (!window.confirm(base)) return
+      window.location.reload()
+      return
+    }
+
+    pushLog('info', `—— 重载界面前：${preflightNames.length} 个待重载插件 client 无头冒烟预检开始 ——`)
+    const reports = await preflightClients(preflightNames)
+    const bad = reports.filter((r) => r.declared && !r.ok)
+
+    if (bad.length === 0) {
+      pushLog('ok', `预检通过：${reports.length} 个待重载插件均无重载崩溃风险`)
+      if (!window.confirm(`${base}\n预检 ${reports.length} 个待重载插件，均无重载崩溃风险。`)) return
+      window.location.reload()
+      return
+    }
+
+    const detail = bad
+      .map((r) => `· ${r.name}\n${renderReportSteps(r)}${r.error ? `\n   根因：${r.error}` : ''}`)
+      .join('\n')
+    pushLog('warn', `预检发现 ${bad.length} 个插件重载时可能崩（${bad.map((b) => b.name).join('、')}）`)
+    const warnMsg =
+      `重载界面前预检发现 ${bad.length} 个插件的 client 在刷新渲染进程时可能崩溃\n` +
+      `（静态存在性检查拦不住这类运行时错误，故在重载前先逐层执行冒烟验证）：\n\n` +
+      `${detail}\n\n` +
+      `仍要重载界面吗？会按原样刷新渲染进程；建议先修复上述插件再重载。`
+    if (!window.confirm(warnMsg)) return
+    pushLog('info', '用户选择继续：仍按原样重载界面')
     window.location.reload()
   }
 
@@ -584,39 +654,30 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     if (pluginName) void call('move', { id: pluginName, folder })
   }
 
-  const reorderPlugin = (p: Plugin, dir: 'up' | 'down'): void => {
-    void call('reorder', { id: p.name, folder: active, dir })
-  }
-
-  /** 插件卡片拖拽重排：在 active 文件夹内把 dragged 移入 target 位置后整体提交。 */
-  const reorderPluginDrop = (dragged: string, target: string): void => {
+  /** 插件卡片拖拽重排：在 active 文件夹内把 dragged 插入到 target 之前（before）/之后（after），整体提交。 */
+  const reorderPluginDrop = (dragged: string, target: string, phase: 'before' | 'after'): void => {
     const from = activePlugins.findIndex((p) => p.name === dragged)
     const to = activePlugins.findIndex((p) => p.name === target)
     if (from < 0 || to < 0 || from === to) return
-    const effectiveTo = dropIndex(to, from)
     const ids = activePlugins
       .map((p) => p.name)
       .filter((n) => n !== dragged)
-    ids.splice(effectiveTo, 0, dragged)
+    const targetIdx = ids.indexOf(target)
+    ids.splice(phase === 'before' ? targetIdx : targetIdx + 1, 0, dragged)
     void call('reorder', { folder: active, ids })
   }
 
-  const moveFolder = (f: Folder, dir: 'up' | 'down'): void => {
-    void call('folders', { action: dir, id: f.id })
-  }
-
-  /** 文件夹行拖拽重排：在自定义文件夹序列内移动并整体提交。 */
-  const reorderFolderDrop = (dragged: string, target: string): void => {
+  /** 文件夹行拖拽重排：在自定义文件夹序列内把 dragged 插入到 target 之前/之后，整体提交。 */
+  const reorderFolderDrop = (dragged: string, target: string, phase: 'before' | 'after'): void => {
     const custom = folders.filter((f) => f.kind === 'custom')
     const ids = custom.map((f) => f.id)
     const from = ids.indexOf(dragged)
     const to = ids.indexOf(target)
     if (from < 0 || to < 0 || from === to) return
-    const effectiveTo = dropIndex(to, from)
-    const next = ids.splice(from, 1)[0]
-    const reordered = ids
-    reordered.splice(effectiveTo, 0, next)
-    void call('folders', { action: 'order', ids: reordered })
+    const filtered = ids.filter((n) => n !== dragged)
+    const targetIdx = filtered.indexOf(target)
+    filtered.splice(phase === 'before' ? targetIdx : targetIdx + 1, 0, dragged)
+    void call('folders', { action: 'order', ids: filtered })
   }
 
   const saveNote = async (p: Plugin, note: string): Promise<void> => {
@@ -652,14 +713,15 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   return (
     <div style={s.root}>
       <div style={s.kernelBanner}>
-        <div style={s.kernelCol}>
+        <span style={s.kernelCol}>
           <span style={s.kernelTitle}>{'当前内核版本'}</span>
           <code style={s.kernelVersion}>{kernel?.current ?? '未知'}</code>
-        </div>
-        <div style={s.kernelCol}>
+        </span>
+        <span style={s.kernelDot}>{'·'}</span>
+        <span style={s.kernelCol}>
           <span style={s.kernelTitle}>{'来源'}</span>
           <span style={s.kernelChannel}>{kernel?.source === 'resolve' ? 'profile 解析' : kernel?.source === 'runtime' ? '运行内置' : '未知'}</span>
-        </div>
+        </span>
       </div>
 
       <div style={s.tabBar}>
@@ -727,20 +789,21 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
                   dragName.current = ''
                   dragKind.current = ''
                   setHoverTarget('')
+                  setDropPhase('')
                 }}
-                onDrop={() => {
+                onDrop={(phase) => {
                   const kind = dragKind.current
                   const id = dragName.current
                   dragName.current = ''
                   dragKind.current = ''
                   setHoverTarget('')
+                  setDropPhase('')
                   if (!id) return
                   if (kind === 'plugin') move(id, f.id)
-                  else if (kind === 'folder' && f.kind === 'custom') reorderFolderDrop(id, f.id)
+                  else if (kind === 'folder' && f.kind === 'custom') reorderFolderDrop(id, f.id, phase)
                 }}
                 onRename={(n) => void renameFolder(f, n)}
                 onDelete={() => void deleteFolder(f)}
-                onMove={(dir) => void moveFolder(f, dir)}
               />
             ))}
           </aside>
@@ -769,7 +832,9 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
                     key={p.name}
                     plugin={p}
                     hover={hoverTarget === `plugin:${p.name}`}
+                    phase={dropPhase}
                     onHoverChange={(h) => setHoverTarget(h ? `plugin:${p.name}` : '')}
+                    onPhaseChange={(ph) => setDropPhase((prev) => (prev === ph ? prev : ph))}
                     onDragStart={() => {
                       dragName.current = p.name
                       dragKind.current = 'plugin'
@@ -778,19 +843,20 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
                       dragName.current = ''
                       dragKind.current = ''
                       setHoverTarget('')
+                      setDropPhase('')
                     }}
-                    onDropBefore={() => {
+                    onDropBefore={(phase) => {
                       const dragged = dragName.current
                       dragName.current = ''
                       dragKind.current = ''
                       setHoverTarget('')
+                      setDropPhase('')
                       if (!dragged) return
-                      if (dragged !== p.name) reorderPluginDrop(dragged, p.name)
+                      if (dragged !== p.name) reorderPluginDrop(dragged, p.name, phase)
                     }}
                     onToggle={() => void toggle(p)}
                     onSaveNote={(n) => void saveNote(p, n)}
                     onRename={(alias) => void renamePlugin(p, alias)}
-                    onMove={(dir) => void reorderPlugin(p, dir)}
                     onPromote={() => void promote(p)}
                     onTempRemove={() => void tempRemove(p)}
                     onUninstall={() => void uninstall(p)}
@@ -967,13 +1033,12 @@ interface RootProps {
   active: boolean
   hover: boolean
   onSelect(): void
-  onDrop(): void
+  onDrop(phase: 'before' | 'after'): void
   onHoverChange(hovering: boolean): void
   onDragStart(): void
   onDragEnd(): void
   onRename(nameText: string): void
   onDelete(): void
-  onMove(dir: 'up' | 'down'): void
 }
 
 function FolderRow(p: RootProps): JSX.Element {
@@ -994,16 +1059,21 @@ function FolderRow(p: RootProps): JSX.Element {
       onDragEnter={(e) => {
         if (!dragKind.current) return
         e.preventDefault()
+        const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+        dragPhase.current = e.clientY < r.top + r.height / 2 ? 'before' : 'after'
         p.onHoverChange(true)
       }}
       onDragLeave={() => p.onHoverChange(false)}
       onDragOver={(e) => {
-        if (dragKind.current) e.preventDefault()
+        if (!dragKind.current) return
+        e.preventDefault()
+        const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+        dragPhase.current = e.clientY < r.top + r.height / 2 ? 'before' : 'after'
       }}
       onDrop={(e) => {
         if (!dragKind.current) return
         e.preventDefault()
-        p.onDrop()
+        p.onDrop(dragPhase.current)
       }}
       onClick={p.onSelect}
     >
@@ -1024,26 +1094,6 @@ function FolderRow(p: RootProps): JSX.Element {
           <span style={s.folderName} title={p.folder.name}>{p.folder.name}</span>
           {p.folder.kind === 'custom' && (
             <span style={s.folderActions}>
-              <button
-                style={s.iconBtnSm}
-                title="上移"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  p.onMove('up')
-                }}
-              >
-                {'↑'}
-              </button>
-              <button
-                style={s.iconBtnSm}
-                title="下移"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  p.onMove('down')
-                }}
-              >
-                {'↓'}
-              </button>
               <button
                 style={s.iconBtnSm}
                 title="重命名"
@@ -1076,14 +1126,15 @@ function FolderRow(p: RootProps): JSX.Element {
 interface CardProps {
   plugin: Plugin
   hover: boolean
+  phase: '' | 'before' | 'after'
   onHoverChange(hovering: boolean): void
+  onPhaseChange(phase: 'before' | 'after'): void
   onDragStart(): void
   onDragEnd(): void
-  onDropBefore(): void
+  onDropBefore(phase: 'before' | 'after'): void
   onToggle(): void
   onSaveNote(note: string): void
   onRename(alias: string): void
-  onMove(dir: 'up' | 'down'): void
   onPromote(): void
   onTempRemove(): void
   onUninstall(): void
@@ -1124,21 +1175,32 @@ function PluginCard(p: CardProps): JSX.Element {
       onDragEnter={(e) => {
         if (dragKind.current !== 'plugin') return
         e.preventDefault()
+        const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+        const ph = e.clientX < r.left + r.width / 2 ? 'before' : 'after'
+        dragPhase.current = ph
         p.onHoverChange(true)
       }}
       onDragLeave={() => {
         if (dragKind.current === 'plugin') p.onHoverChange(false)
       }}
       onDragOver={(e) => {
-        if (dragKind.current === 'plugin') e.preventDefault()
+        if (dragKind.current !== 'plugin') return
+        e.preventDefault()
+        const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
+        const ph = e.clientX < r.left + r.width / 2 ? 'before' : 'after'
+        dragPhase.current = ph
+        p.onPhaseChange(ph)
       }}
       onDrop={(e) => {
         if (dragKind.current !== 'plugin') return
         e.preventDefault()
-        p.onDropBefore()
+        p.onDropBefore(dragPhase.current)
       }}
       onClick={() => setShowDeps((v) => !v)}
     >
+      {p.hover && p.phase && (
+        <div style={{ ...s.dropLine, ...(p.phase === 'after' ? { left: 'calc(100% - 2px)' } : { left: 0 }) }} />
+      )}
       <div style={s.cardHead} onClick={stop}>
         <span style={badgeStyle}>{scopeLabel}</span>
         <span style={s.headRight}>
@@ -1155,7 +1217,7 @@ function PluginCard(p: CardProps): JSX.Element {
           <label style={s.switchLabel} title={p.plugin.toggleable ? '点击启停' : '内置插件不可停用'}>
             <input style={s.checkboxHidden} type="checkbox" checked={p.plugin.enabled} disabled={!p.plugin.toggleable} onChange={p.onToggle} />
             <span style={{ ...s.switch, background: p.plugin.enabled ? 'var(--dsw-alias-state-business-primary)' : 'var(--dsw-alias-bg-layer-3)' }}>
-              <span style={{ ...s.knob, transform: p.plugin.enabled ? 'translateX(16px)' : 'translateX(0)' }} />
+              <span style={{ ...s.knob, transform: p.plugin.enabled ? 'translateX(20px)' : 'translateX(0)' }} />
             </span>
           </label>
           {p.plugin.hot === 'temporary' && (
@@ -1166,6 +1228,14 @@ function PluginCard(p: CardProps): JSX.Element {
           )}
           {p.plugin.hot === 'promoted' && (
             <span style={s.promotedHint} title="重启后由装配清单持久加载；当前进程内原临时 entry 仍运行至退出">{'重启后持久生效'}</span>
+          )}
+          {p.plugin.hot !== 'temporary' && !p.plugin.residual && p.plugin.scope === 'third' && p.plugin.toggleable && (
+            <button style={s.uninstallBtn} title="真卸载：移出磁盘、注销装配并清理备注/分类" onClick={(e) => {
+              stop(e)
+              p.onUninstall()
+            }}>
+              {'卸载'}
+            </button>
           )}
         </span>
       </div>
@@ -1218,10 +1288,6 @@ function PluginCard(p: CardProps): JSX.Element {
           >
             {'✎'}
           </button>
-          <span style={s.moveBtns} onClick={stop}>
-            <button style={s.moveBtn} title="上移" onClick={(e) => { stop(e); p.onMove('up') }}>{'↑'}</button>
-            <button style={s.moveBtn} title="下移" onClick={(e) => { stop(e); p.onMove('down') }}>{'↓'}</button>
-          </span>
         </div>
       )}
 
@@ -1273,17 +1339,6 @@ function PluginCard(p: CardProps): JSX.Element {
           </button>
         )}
       </div>
-
-      {p.plugin.hot !== 'temporary' && !p.plugin.residual && p.plugin.scope === 'third' && p.plugin.toggleable && (
-        <div style={s.cardFooter}>
-          <button style={s.uninstallBtn} title="真卸载：移出磁盘、注销装配并清理备注/分类" onClick={(e) => {
-            stop(e)
-            p.onUninstall()
-          }}>
-            {'卸载'}
-          </button>
-        </div>
-      )}
     </div>
   )
 }
@@ -1299,14 +1354,24 @@ const STATE_INFO: Record<string, string> = {
   none: '未加载',
 }
 
-/** 运行时状态徽标的基础样式（模块级常量，先于 STATE_STYLE 定义）。 */
-const statePillBase: CSSProperties = {
-  padding: '1px 7px',
+/** 统一徽标/状态胶囊的基础尺寸：卡片头部的第三方/临时/运行中/待重启/已卸载/转正/卸载/✕ 全部对齐。 */
+const pillBase: CSSProperties = {
+  display: 'inline-flex',
+  alignItems: 'center',
+  height: 20,
+  boxSizing: 'border-box',
+  padding: '0 7px',
   borderRadius: 5,
   fontSize: 12,
   fontWeight: 500,
-  fontFamily: 'var(--ds-font-family-code)',
   whiteSpace: 'nowrap',
+  lineHeight: 1,
+}
+
+/** 运行时状态徽标的基础样式（先于 STATE_STYLE 定义）。 */
+const statePillBase: CSSProperties = {
+  ...pillBase,
+  fontFamily: 'var(--ds-font-family-code)',
   color: 'var(--dsw-alias-label-secondary)',
   background: 'var(--dsw-alias-bg-module-platform)',
 }
@@ -1327,7 +1392,10 @@ const STATE_STYLE: Record<string, CSSProperties> = {
   loading: statePillBase,
   disposed: statePillBase,
   unloading: statePillBase,
-  none: { ...statePillBase, color: 'var(--dsw-alias-label-tertiary)', background: 'transparent' },
+  none: {
+    ...statePillBase,
+    background: 'color-mix(in srgb, var(--dsw-alias-label-tertiary) 10%, transparent)',
+  },
 }
 
 /** 日志级别 → 文本颜色（ok=成功 / warn=警告 / err=危险 / 其它中性）。 */
@@ -1476,22 +1544,25 @@ const s: Record<string, CSSProperties> = {
   kernelBanner: {
     display: 'flex',
     alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: '10px 18px',
-    padding: '10px 14px',
+    flexWrap: 'nowrap',
+    whiteSpace: 'nowrap',
+    gap: 16,
+    padding: '8px 14px',
     borderRadius: 10,
     background: 'var(--dsw-alias-bg-layer-1)',
     border: '1px solid var(--dsw-alias-border-l1)',
     boxShadow: 'var(--dsw-shadow-lv1)',
   },
-  kernelCol: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
-  kernelTitle: { color: 'var(--dsw-alias-label-secondary)', fontSize: 12, fontWeight: 500, },
-  kernelVersion: { fontSize: 15, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
+  kernelCol: { display: 'flex', flexDirection: 'row', alignItems: 'baseline', gap: 6, minWidth: 0 },
+  kernelDot: { color: 'var(--dsw-alias-label-tertiary)', fontSize: 13 },
+  kernelTitle: { color: 'var(--dsw-alias-label-secondary)', fontSize: 12, fontWeight: 500, whiteSpace: 'nowrap' },
+  kernelVersion: { fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', whiteSpace: 'nowrap' },
   kernelChannel: {
-    fontSize: 13,
+    fontSize: 12,
     fontWeight: 500,
     color: 'var(--dsw-alias-label-primary)',
     fontFamily: 'var(--ds-font-family-code)',
+    whiteSpace: 'nowrap',
   },
   body: { display: 'flex', gap: 14, minHeight: 0, flex: 1, alignItems: 'flex-start' },
   sidebar: {
@@ -1537,16 +1608,6 @@ const s: Record<string, CSSProperties> = {
     cursor: 'pointer',
     padding: '0 3px',
     fontSize: 12,
-  },
-  moveBtns: { display: 'inline-flex', alignItems: 'center', gap: 0, flexShrink: 0, opacity: 0.7 },
-  moveBtn: {
-    border: 'none',
-    background: 'transparent',
-    color: 'var(--dsw-alias-label-tertiary)',
-    cursor: 'pointer',
-    padding: '0 2px',
-    fontSize: 12,
-    lineHeight: 1,
   },
   createBox: { display: 'flex', gap: 6, margin: '0 2px 4px' },
   input: {
@@ -1601,7 +1662,18 @@ const s: Record<string, CSSProperties> = {
     flexShrink: 0,
   },
   cards: { flex: 1, display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0, minHeight: 0 },
-  cardsHeader: { display: 'flex', alignItems: 'baseline', gap: 8, padding: '0 2px' },
+  cardsHeader: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 8,
+    padding: '6px 2px',
+    position: 'sticky',
+    top: 0,
+    zIndex: 5,
+    background: 'color-mix(in srgb, var(--dsw-alias-bg-layer-1) 92%, transparent)',
+    backdropFilter: 'blur(4px)',
+    borderBottom: '1px solid var(--dsw-alias-border-l1)',
+  },
   cardsTitle: { fontSize: 15, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', margin: 0 },
   cardsCount: { color: 'var(--dsw-alias-label-tertiary)', fontSize: 12 },
   // 改造2：拖拽悬停落点高亮（文件夹行）。
@@ -1689,60 +1761,43 @@ const s: Record<string, CSSProperties> = {
   },
   headRight: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
   tempBadge: {
-    padding: '1px 6px',
-    borderRadius: 5,
-    fontSize: 11,
-    fontWeight: 600,
+    ...pillBase,
     color: 'var(--dsw-alias-state-business-primary)',
     background: 'color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent)',
-    whiteSpace: 'nowrap',
   },
   promotedBadge: {
-    padding: '1px 6px',
-    borderRadius: 5,
-    fontSize: 11,
-    fontWeight: 600,
+    ...pillBase,
     color: 'var(--dsw-alias-state-warning-primary)',
     background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 14%, transparent)',
     border: '1px dashed var(--dsw-alias-state-warning-primary)',
-    whiteSpace: 'nowrap',
   },
   residualBadge: {
-    padding: '1px 6px',
-    borderRadius: 5,
-    fontSize: 11,
-    fontWeight: 600,
+    ...pillBase,
     color: 'var(--dsw-alias-label-tertiary)',
     background: 'color-mix(in srgb, var(--dsw-alias-label-tertiary) 12%, transparent)',
     border: '1px solid transparent',
     textDecoration: 'line-through',
-    whiteSpace: 'nowrap',
   },
   promotedHint: {
-    fontSize: 11,
+    fontSize: 12,
     fontWeight: 500,
     color: 'var(--dsw-alias-state-warning-primary)',
     opacity: 0.85,
     whiteSpace: 'nowrap',
   },
   tempRemoveBtn: {
-    border: 'none',
-    background: 'transparent',
-    color: 'var(--dsw-alias-label-tertiary)',
+    ...pillBase,
+    color: 'var(--dsw-alias-state-danger-primary)',
+    background: 'color-mix(in srgb, var(--dsw-alias-state-danger-primary) 8%, transparent)',
+    border: '1px solid color-mix(in srgb, var(--dsw-alias-state-danger-primary) 40%, transparent)',
     cursor: 'pointer',
-    padding: '0 3px',
-    fontSize: 12,
-    lineHeight: 1,
   },
   promoteBtn: {
+    ...pillBase,
     border: '1px solid var(--dsw-alias-state-warning-primary)',
-    background: 'transparent',
+    background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 14%, transparent)',
     color: 'var(--dsw-alias-state-warning-primary)',
-    borderRadius: 6,
-    padding: '1px 8px',
     cursor: 'pointer',
-    fontSize: 11, fontWeight: 600,
-    whiteSpace: 'nowrap',
   },
   flash: {
     padding: '8px 12px',
@@ -1768,6 +1823,17 @@ const s: Record<string, CSSProperties> = {
     border: '1px solid var(--dsw-alias-border-l1)',
     boxShadow: 'var(--dsw-shadow-lv1)',
     cursor: 'grab',
+    position: 'relative',
+  },
+  // 拖拽排序插入指示条：悬停时在目标卡片左/右边缘显示 2px 竖线（改造：放宽精确落点）。
+  dropLine: {
+    position: 'absolute',
+    top: 4,
+    bottom: 4,
+    width: 2,
+    zIndex: 3,
+    borderRadius: 2,
+    background: 'var(--dsw-alias-state-business-primary)',
   },
   // 改造2：拖拽悬停落点高亮（插件卡片）。
   cardOver: {
@@ -1776,28 +1842,22 @@ const s: Record<string, CSSProperties> = {
   },
   cardHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
   badge: {
-    padding: '1px 7px',
-    borderRadius: 5,
+    ...pillBase,
+    fontFamily: 'var(--ds-font-family-code)',
     color: 'var(--dsw-alias-state-business-primary)',
     background: 'color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent)',
-    fontSize: 12, fontWeight: 500,
-    fontFamily: 'var(--ds-font-family-code)',
   },
   badgeThird: {
-    padding: '1px 7px',
-    borderRadius: 5,
+    ...pillBase,
+    fontFamily: 'var(--ds-font-family-code)',
     color: 'var(--dsw-alias-label-secondary)',
     background: 'var(--dsw-alias-bg-module-platform)',
-    fontSize: 12, fontWeight: 500,
-    fontFamily: 'var(--ds-font-family-code)',
   },
   badgeShell: {
-    padding: '1px 7px',
-    borderRadius: 5,
+    ...pillBase,
+    fontFamily: 'var(--ds-font-family-code)',
     color: 'var(--dsw-alias-tertiary-color, var(--dsw-alias-state-warning-primary))',
     background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 12%, transparent)',
-    fontSize: 12, fontWeight: 500,
-    fontFamily: 'var(--ds-font-family-code)',
   },
   cardTitleRow: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
   cardName: {
@@ -1852,21 +1912,12 @@ const s: Record<string, CSSProperties> = {
     wordBreak: 'break-all',
     lineHeight: '15px',
   },
-  cardFooter: {
-    display: 'flex',
-    justifyContent: 'flex-end',
-    paddingTop: 6,
-    borderTop: '1px solid var(--dsw-alias-border-l2)',
-  },
   uninstallBtn: {
+    ...pillBase,
     border: '1px solid color-mix(in srgb, var(--dsw-alias-state-danger-primary) 45%, transparent)',
-    background: 'transparent',
+    background: 'color-mix(in srgb, var(--dsw-alias-state-danger-primary) 14%, transparent)',
     color: 'var(--dsw-alias-state-danger-primary)',
-    borderRadius: 6,
-    padding: '2px 10px',
     cursor: 'pointer',
-    fontSize: 11, fontWeight: 600,
-    whiteSpace: 'nowrap',
   },
   cardDesc: {
     fontSize: 12,
@@ -1911,8 +1962,8 @@ const s: Record<string, CSSProperties> = {
   switchLabel: { display: 'inline-flex', alignItems: 'center', cursor: 'pointer' },
   checkboxHidden: { opacity: 0, position: 'absolute', width: 0, height: 0, margin: 0, pointerEvents: 'none' },
   switch: {
-    width: 34,
-    height: 18,
+    width: 40,
+    height: 20,
     borderRadius: 999,
     position: 'relative',
     display: 'inline-block',
@@ -1924,8 +1975,8 @@ const s: Record<string, CSSProperties> = {
     position: 'absolute',
     top: 2,
     left: 2,
-    width: 14,
-    height: 14,
+    width: 16,
+    height: 16,
     borderRadius: 999,
     background: '#fff',
     boxShadow: 'var(--dsw-shadow-lv1)',

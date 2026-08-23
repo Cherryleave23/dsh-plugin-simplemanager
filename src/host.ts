@@ -392,6 +392,21 @@ export class SimpleManagerHost {
     overlay.hotInstalls.splice(i, 1)
     this.writeOverlay(overlay)
   }
+
+  /** 判断某插件是否由 **bundle 装配层** 管理（官方 `dsh plugin add` 渠道：profile package.json
+   * `dsh.profile.bundles` 清单，或 `cordis.yml` 顶层序列装配项）。与 patch 层（cordis.patch.yml）区分：
+   * bundle 层插件重启由该层恢复装配，启停不能写 patch（否则与 cordis.yml 重复装配 → duplicate loader entry id）。
+   * @known-fragile 装配清单直读（见 MANIFEST「不许碰清单」），格式非公共契约。 */
+  isBundleAssembled(packageName: string): boolean {
+    if (this.readBundles().has(packageName)) return true
+    const file = join(this.profileDir, 'cordis.yml')
+    if (!existsSync(file)) return false
+    const raw = readFileSync(file, 'utf8')
+    const escaped = packageName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const re = new RegExp(`^(?:-\\s+)?(?:id|name):\\s*['"]?${escaped}['"]?\\s*$`)
+    for (const line of raw.split(/\r?\n/)) if (re.test(line.trim())) return true
+    return false
+  }
 }
 
 function pushProfileBundle(

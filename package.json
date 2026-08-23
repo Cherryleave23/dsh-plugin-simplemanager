@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-simplemanager",
-  "version": "0.1.0",
+  "version": "0.1.1-rc.2",
   "description": "插件管家：内核版本看板 + 第三方插件统一管理。内置「官方内置 / 第三方插件」默认文件夹，支持自定义分类与备注、一键启停（写入全局层补丁并实时热生效）、内核更新检测（仅提示不自动更新）。",
   "type": "module",
   "main": "./lib/index.js",
