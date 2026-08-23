@@ -45,21 +45,16 @@
 
 ### 安装插件
 
-本插件通过官方 `dsh plugin add` 安装到 profile，依赖闭包由 pnpm 自动落实：
+**一条命令即可安装，开箱即用**——它会自动从 npm 解析并落实插件依赖闭包、装配到 profile 并持久启用，无需重启桌面壳，也无需再做任何手动步骤：
 
 ```sh
-# 方式一：npm 安装（recommended，latest = 0.1.1-rc.2-v1，含复制报告）
 dsh plugin add dsh-plugin-simplemanager
-
-# 方式二：按本地版本目录 / zip 安装
-dsh plugin add "file:D:\path\to\dsh-v0.1.1-rc.2"
-dsh plugin add "file:D:\path\to\dsh-plugin-simplemanager-0.1.1-rc.2.zip"
-
-# 安装到指定 profile
-dsh plugin --profile <name> add dsh-plugin-simplemanager
 ```
 
-> 🆕 **npm 镜像版本**：npm 不允许覆盖已发布的 `0.1.1-rc.2`，故含复制功能的最新内容以 **`0.1.1-rc.2-v1`** 发布（`latest` 指向它），与本地 `0.1.1-rc.2` zip 代码一致、仅版本号后缀 `-v1`。想用 npm 安装并收到最新功能，直接用方式一即可；方式二指向 **含 `package.json` 的版本目录或发布 zip**。
+装完直接打开桌面壳 **设置 → 插件 → 插件管家** 即可使用。
+
+> 指定 profile 安装：`dsh plugin --profile <name> add dsh-plugin-simplemanager`。
+> 版本说明：默认安装 npm `latest`，持续收到最新功能修复；需要锁定内核适配版本时显式指定，如 `dsh plugin add dsh-plugin-simplemanager@0.1.1-rc.2`。
 
 ### 卸载插件
 
