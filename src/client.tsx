@@ -7,10 +7,18 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent } from 'react'
-import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
 
 export const name = 'dsh-plugin-simplemanager'
 export const inject = ['slots']
+
+/**
+ * 本插件消费的 slots 服务最小类型面。官方真实类型是 `dsh-client-runtime` 的 `SlotRegistry`，
+ * 但该包非本插件依赖、且经 `declare module` 扩展注入（独立工程内解析不到），故按实际调用结构性收窄。
+ */
+type SlotsService = {
+  inject(key: string, callback: () => unknown): () => void
+  register(...args: unknown[]): unknown
+}
 
 type AppClientContext = {
   slots: SlotsService
@@ -34,26 +42,61 @@ interface Plugin {
   version: string
   description: string
   scope: 'official' | 'shell' | 'third'
-  source: 'runtime' | 'profile' | 'temp'
+  /** 来源轴：官方/壳/临时/持久/孤儿（标准 = 真实装配数据）。 */
+  source: 'official' | 'shell' | 'temporary' | 'persistent' | 'orphan'
   enabled: boolean
-  toggleable: boolean
+  /** 运行态：active/loading/pending 活态；disabled 已停用；failed…=fiber phase；none 未装配。 */
+  runtime: 'active' | 'disabled' | 'failed' | 'pending' | 'loading' | 'disposed' | 'unloading' | 'none'
   folder: string
   note: string
   alias: string
-  /** 运行时状态：active=已活跃 / failed=启动失败 / pending=待加载 / loading=加载中 / disposed=已卸载 / unloading=卸载中 / null=无 fiber。 */
-  state: 'active' | 'failed' | 'pending' | 'loading' | 'disposed' | 'unloading' | null
   /** 插件自身声明的依赖（name@range）；临时插件为本次补装的闭包依赖。点击卡片展开可见。 */
   dependencies: string[]
-  /** 热插拔生命周期档位：temporary = 本会话临时加载（重启即消失）；promoted = 已转正、重启后变持久；null = 非热插拔（持久安装/官方/壳）。 */
-  hot: 'temporary' | 'promoted' | null
-  /** 本会话刚卸载、列表仍显示其收敛中条目的残留标记：应标为「已卸载、不可启停」，重启后自然消失。 */
-  residual?: boolean
+  /** 状态框可点击启停（官方/壳 + 孤儿为 false）。 */
+  toggleable: boolean
+  /** 显示「卸载」/「清理」动作按钮。 */
+  removable: boolean
+  /** 显示「转正」（仅临时）。 */
+  promoteable: boolean
+  /** 显示「✕」临时卸载（仅临时）。 */
+  tempRemoveable: boolean
+  /** 「转正·待重启」注记。 */
+  pendingRestart: boolean
 }
 
 interface Browse {
   ok: boolean
   folders: Folder[]
   plugins: Plugin[]
+}
+
+// —— 第三板块「代码规范治理」诊断类型（镜像内核 diagnostics.ts）——
+type DiagLevel = 'ok' | 'warn' | 'err'
+interface DiagRule {
+  ruleId: number
+  title: string
+  level: DiagLevel
+  detail: string
+  evidence: Array<{ file: string; line: number; snippet: string }>
+  suggest: string
+}
+interface PluginDiagnostic {
+  name: string
+  pkgDir: string | null
+  scanned: number
+  runtime: { phase: string | null }
+  rules: DiagRule[]
+  summary: { ok: number; warn: number; err: number }
+}
+
+/** 统一确认弹窗请求。withClearData=true 时额外显示「同时清除缓存/配置」开关节。 */
+interface AskReq {
+  title: string
+  message: string
+  okText?: string
+  danger?: boolean
+  withClearData?: boolean
+  resolve: (r: { ok: boolean; clearData: boolean }) => void
 }
 
 const API = '/simplemanager'
@@ -102,14 +145,25 @@ async function browse(): Promise<Browse> {
 
 /** client 无头冒烟预检：单步结果（load 注册 / apply 等），ok=false 的那步即重载崩溃根因。 */
 interface SmokeStepOutcome { name: string; ok: boolean; detail: string }
-/** client 无头冒烟预检：单个插件的整体结论（declared=true 且 ok=false ⇒ 该插件重载前端时可能崩）。 */
+/** 预检结局类别，reloadClient 按此分组渲染，避免把"必挂起"错标成"崩溃"（详见后端同类定义）。 */
+type SmokeOutcome = 'pending' | 'crash' | 'volatile' | 'warn' | 'pass'
+/** client 无头冒烟预检：单个插件的整体结论。ok = 能否安全 reload；outcome = 精确结局类别。 */
 interface ClientSmokeReport {
   name: string
   declared: boolean
   ok: boolean
+  /** 真 cordis 门禁后端产出（true）或三态近似（false）。 */
+  realGate: boolean
+  outcome: SmokeOutcome
   steps: SmokeStepOutcome[]
   error?: string
+  /** 非阻塞警告：重载会挂起等待的注入服务、被服务门禁屏蔽的潜在缺陷、实验室模式说明。 */
+  warns?: string[]
 }
+
+/** 重载预检后端模式：three-state=三态门禁（默认）；real-cordis=真 cordis 门禁（实验室，仅门禁不深挖）。 */
+type PreflightMode = 'three-state' | 'real-cordis'
+const PREFLIGHT_MODE_KEY = 'dsh-plugin-simplemanager:preflightMode'
 
 /** 目录浏览层级（官方 directoryPicker.list 返回面）。 */
 interface DirLevel {
@@ -189,6 +243,23 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const [hoverTarget, setHoverTarget] = useState('')
   /** 当前拖拽悬停的落点相位（目标中点前/后），用于插入指示条（改造：拖拽排序放宽）。 */
   const [dropPhase, setDropPhase] = useState<'before' | 'after' | ''>('')
+  /** 第三板块：代码规范治理诊断结果（按插件聚合）。 */
+  const [diag, setDiag] = useState<PluginDiagnostic[]>([])
+  const [diagBusy, setDiagBusy] = useState(false)
+  // 诊断范围（多选文件夹，localStorage 持久化，避免每次手动勾选）。空数组 = 全部第三方。
+  const [diagFolders, setDiagFolders] = useState<string[]>(() => {
+    try {
+      const raw = localStorage.getItem('dsh-plugin-simplemanager:diagFolders')
+      if (raw) {
+        const arr = JSON.parse(raw)
+        if (Array.isArray(arr)) return arr.filter((x): x is string => typeof x === 'string')
+      }
+    } catch { /* 解析失败退回全量诊断 */ }
+    return []
+  })
+  /** 统一确认弹窗（dsh 客户端风格卡片）：替代浏览器原生 confirm，支持可选「同时清除缓存」开关。 */
+  const [ask, setAsk] = useState<AskReq | null>(null)
+  const [askClearData, setAskClearData] = useState(false)
 
   const refresh = useCallback(async () => {
     const view = await browse()
@@ -202,6 +273,40 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   useEffect(() => {
     void refresh()
   }, [refresh])
+
+  // 诊断范围选择持久化到 localStorage（跨重启保留，不用每次勾选）。
+  useEffect(() => {
+    try { localStorage.setItem('dsh-plugin-simplemanager:diagFolders', JSON.stringify(diagFolders)) } catch { /* ignore */ }
+  }, [diagFolders])
+
+  // 重载预检后端模式：默认三态门禁；真 cordis 门禁为实验室模式（开启前需确认，见 setPreflightMode）。
+  const [preflightMode, setPreflightModeState] = useState<PreflightMode>(() => {
+    try {
+      const raw = localStorage.getItem(PREFLIGHT_MODE_KEY)
+      if (raw === 'real-cordis') return 'real-cordis'
+    } catch { /* 解析失败退回三态 */ }
+    return 'three-state'
+  })
+  useEffect(() => {
+    try { localStorage.setItem(PREFLIGHT_MODE_KEY, preflightMode) } catch { /* ignore */ }
+  }, [preflightMode])
+  /** 切换预检模式：切到实验室（真 cordis）前先弹提醒说明风险，确认后才开启。 */
+  const setPreflightMode = async (next: PreflightMode): Promise<void> => {
+    if (next === preflightMode) return
+    if (next === 'real-cordis') {
+      const { ok } = await askConfirm({
+        title: '开启实验室模式',
+        message: '真 cordis 门禁（实验室）：用真实 @deepseek-ai/cordis 判定注入服务可达性，并在门禁通过后继续跑 apply/渲染/数据驱动渲染全套 VM 检测（检测最全）。\n\n'
+          + '· 相比基础模式（仅三态门禁、不深挖 apply/渲染），实验室额外执行 apply 深挖 + 数据驱动渲染探测，能抓取基础模式漏过的渲染/异步错误；\n'
+          + '· 依赖 profile 中可解析的真实 cordis（解析不到会回退三态近似）；\n'
+          + '· 门禁通过后继续深挖，检测更全但耗时更长。\n\n是否开启？',
+        okText: '开启',
+      })
+      if (!ok) return
+    }
+    setPreflightModeState(next)
+    pushLog('info', `重载预检模式切换为 ${next === 'real-cordis' ? '真 cordis 门禁（实验室）' : '三态门禁（默认）'}`)
+  }
 
   // 订阅日志/步骤 store：任何写入触发组件重渲染（含组件重挂载时同步 latest）。
   useEffect(() => {
@@ -260,12 +365,10 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
 
   /** 复制当前全部日志到剪贴板，组内做提示。 */
   const copyLogs = (): void => {
-    if (logs.length === 0) {
-      notify('暂无日志可复制')
-      return
-    }
+    if (logs.length === 0) return
     const text = logs.map((l) => `[${l.time}] ${l.text}`).join('\n')
-    const done = (): void => notify(`已复制 ${logs.length} 行日志`)
+    // 复制成功不再弹顶部绿色提示（操作日志已承载反馈），仅失败保留错误提示。
+    const done = (): void => { /* noop */ }
     try {
       if (navigator.clipboard && window.isSecureContext) {
         void navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done))
@@ -294,7 +397,8 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
 
   /** 复制预检风险报告到剪贴板（复用日志兜底逻辑），组内做提示。 */
   const copyRiskReport = (text: string): void => {
-    const done = (): void => notify('已复制预检报告，可粘贴到插件处修改')
+    // 复制成功不弹顶部绿色提示，失败保留错误提示。
+    const done = (): void => { /* noop */ }
     try {
       if (navigator.clipboard && window.isSecureContext) {
         void navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done))
@@ -311,6 +415,87 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     logSubscribe?.()
     setLogs([])
     setSteps(null)
+  }
+
+  /** 第三板块：一键体检——静态扫全部第三方已装插件副本库，按禁做清单逐条取证。只读。 */
+  const toggleDiagFolder = (id: string): void => {
+    setDiagFolders((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+  }
+
+  const runDiagnostics = async (): Promise<void> => {
+    if (diagBusy) return
+    setDiagBusy(true)
+    pushLog('info', '开始代码规范体检（扫描所选文件夹内的第三方插件副本库）…')
+    try {
+      const r = await api<{ ok: boolean; report?: PluginDiagnostic[]; error?: string }>(`${API}/diagnostics`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ names: [], folders: diagFolders }),
+      })
+      if (!r.ok || !r.report) {
+        notify(r.error ?? '体检失败')
+        pushLog('err', `代码规范体检失败：${r.error ?? '未知原因'}`)
+        return
+      }
+      setDiag(r.report)
+      const err = r.report.flatMap((p) => p.rules).filter((x) => x.level === 'err').length
+      const warn = r.report.flatMap((p) => p.rules).filter((x) => x.level === 'warn').length
+      pushLog(err || warn ? 'warn' : 'ok', `体检完成：${r.report.length} 个插件 · 违规 ${err} 项 / 疑点 ${warn} 项`)
+    } catch (e) {
+      notify('体检请求失败')
+      pushLog('err', `代码规范体检请求异常：${String(e)}`)
+    } finally {
+      setDiagBusy(false)
+    }
+  }
+
+  /** 把诊断结果序列化为报告文本（供复制）。仅含非 ok 项，保留证据行号。 */
+  const formatDiagReport = (list: PluginDiagnostic[] = diag): string => {
+    if (list.length === 0) return '（尚未进行体检，或当前无诊断结果）'
+    const out: string[] = []
+    for (const p of list) {
+      const issues = p.rules.filter((r) => r.level !== 'ok')
+      out.push(`## ${p.name}${p.pkgDir ? `\n副本：${p.pkgDir}` : ''}${p.runtime.phase === 'failed' ? '\n⚠ 运行态：failed（启动失败，需重装）' : ''}`)
+      if (issues.length === 0) {
+        out.push('✓ 全部规则通过')
+        continue
+      }
+      for (const r of issues) {
+        const mark = r.level === 'err' ? '✗ 违规' : '⚠ 疑点'
+        out.push(`- [${mark}] 规则${r.ruleId} ${r.title}`)
+        out.push(`  说明：${r.detail}`)
+        for (const ev of r.evidence) out.push(`  证据：${ev.file}${ev.line ? ':' + ev.line : ''} ${ev.snippet}`)
+        if (r.suggest) out.push(`  建议：${r.suggest}`)
+      }
+    }
+    return out.join('\n')
+  }
+
+  const copyDiagReport = (): void => {
+    if (diag.length === 0) return
+    const text = formatDiagReport()
+    // 复制成功不弹顶部绿色提示，失败保留错误提示。
+    const done = (): void => { /* noop */ }
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        void navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done))
+        return
+      }
+    } catch { /* 走 fallback */ }
+    fallbackCopy(text, done)
+  }
+
+  /** 打开统一确认弹窗（dsh 客户端风格卡片），返回用户的选择。
+   * 所有关闭路径（确认/取消/背景点击/✕）都经同一包装 resolve：先 setAsk(null) 收起弹窗、再 resolve 结果，
+   * 避免只 resolve 不关窗导致弹窗残留、按钮"按了没反应"。 */
+  const askConfirm = (opts: { title: string; message: string; okText?: string; danger?: boolean; withClearData?: boolean }): Promise<{ ok: boolean; clearData: boolean }> => {
+    setAskClearData(false)
+    return new Promise<{ ok: boolean; clearData: boolean }>((resolve) => {
+      setAsk({
+        ...opts,
+        resolve: (r: { ok: boolean; clearData: boolean }) => { setAsk(null); resolve(r) },
+      })
+    })
   }
 
   /** 后端步进 level 字符串 → 前端日志着色级别（未知等级兜底 info）。 */
@@ -345,7 +530,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     }
     await refresh()
     const applied = r.hotApplied ? '已热生效' : '重启后生效'
-    notify(r.enabled ? '已启用' + (r.hotApplied ? '' : '（重启后生效）') : '已停用' + (r.hotApplied ? '' : '（重启后生效）'))
+    // 启停成功信息已在下方操作日志记录，不再弹顶部绿色提示。
     pushLog(r.enabled ? 'ok' : 'info', `${r.enabled ? '启用' : '停用'}插件 ${p.name}（${applied}）`)
   }
 
@@ -369,11 +554,9 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
       if (r.ok) {
         pushLog(r.depsApplied ? 'ok' : 'warn', `内核装配完成（${((t1 - t0) / 1000).toFixed(1)}s）：${r.depsApplied ? '依赖已装齐' : `依赖获取失败（${r.pnpmReason ?? '未知'}）`}`)
         if (r.hotApplied) {
-          notify('已装配并运行期启用')
           pushLog('ok', '已在运行期启用（无需重启）')
           setTempInput('')
         } else {
-          notify('已装配，重启后由该插件生效')
           pushLog('info', '已装配，重启后生效')
           setTempInput('')
         }
@@ -499,13 +682,14 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     }, 400)
   }
 
-  /** 重载 CLIENT 层前，对「活跃插件」做无头冒烟预检请求（kernel 进程真实执行 client bundle 的 load 注册 + apply）。 */
-  const preflightClients = async (names: string[]): Promise<ClientSmokeReport[]> => {
+  /** 重载 CLIENT 层前，对「活跃插件」做无头冒烟预检请求（kernel 进程真实执行 client bundle 的 load 注册 + apply）。
+   * mode='real-cordis'（实验室）走真 cordis 门禁（仅门禁不深挖）；缺省/other 走三态门禁+apply 深挖。 */
+  const preflightClients = async (names: string[], mode: PreflightMode): Promise<ClientSmokeReport[]> => {
     try {
       const r = await api<{ ok?: boolean; results: ClientSmokeReport[] }>(`${API}/verifyClient`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ names }),
+        body: JSON.stringify({ names, mode }),
       })
       return r.results ?? []
     } catch {
@@ -527,39 +711,70 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     const preflightNames = plugins
       .filter(
         (p) =>
-          p.state != null &&
+          p.runtime != null &&
           !p.name.startsWith('@deepseek-ai/') &&
-          ['active', 'pending', 'loading', 'failed'].includes(p.state),
+          ['active', 'pending', 'loading', 'failed'].includes(p.runtime),
       )
       .map((p) => p.name)
     const base = '重载界面（仅刷新渲染进程，不重启内核）？\n当前会话与内核热装状态都会保留。'
 
     if (preflightNames.length === 0) {
-      if (!window.confirm(base)) return
+      const { ok } = await askConfirm({ title: '重载界面', message: base, okText: '重载' })
+      if (!ok) return
       window.location.reload()
       return
     }
 
-    pushLog('info', `—— 重载界面前：${preflightNames.length} 个待重载插件 client 无头冒烟预检开始 ——`)
-    const reports = await preflightClients(preflightNames)
-    const bad = reports.filter((r) => r.declared && !r.ok)
+    const modeLabel = preflightMode === 'real-cordis' ? '真 cordis 门禁（实验室）' : '三态门禁'
+    pushLog('info', `—— 重载界面前：${preflightNames.length} 个待重载插件 client 无头冒烟预检开始（${modeLabel}）——`)
+    const reports = await preflightClients(preflightNames, preflightMode)
+    // 用 outcome 精确分级，而非把 ok 当"崩溃"二值：
+    //   阻断(pending/crash)：重载必失败——fixture 的"必挂起"与"真实崩溃"同级，都是重载进不去/白屏。
+    //   关注(volatile/warn)：可重载但应知晓——缺 client 产物、实验室模式说明、未知服务名等。
+    //   pass：安全。
+    const blockers = reports.filter((r) => r.declared && (r.outcome === 'pending' || r.outcome === 'crash'))
+    // 关注项里拆出"模式级说明"（如实验室不深挖），与"插件级缺陷"区分，避免混在一个列表。
+    const concernees = reports.filter((r) =>
+      r.declared && (r.outcome === 'volatile' || r.outcome === 'warn') &&
+      (r.warns ?? []).some((w) => !w.startsWith('实验室模式')),
+    )
+    // 纯模式说明（不指向具体插件缺陷）单独展示
+    const modeNotes = reports
+      .filter((r) => (r.warns ?? []).some((w) => w.startsWith('实验室模式')))
+      .flatMap((r) => (r.warns ?? []).filter((w) => w.startsWith('实验室模式')))
 
-    if (bad.length === 0) {
-      pushLog('ok', `预检通过：${reports.length} 个待重载插件均无重载崩溃风险`)
-      if (!window.confirm(`${base}\n预检 ${reports.length} 个待重载插件，均无重载崩溃风险。`)) return
+    if (blockers.length === 0 && concernees.length === 0 && modeNotes.length === 0) {
+      pushLog('ok', `预检通过：${reports.length} 个待重载插件均无重载失败风险`)
+      const { ok } = await askConfirm({ title: '重载界面', message: `${base}\n预检 ${reports.length} 个待重载插件，均无重载失败风险。`, okText: '重载' })
+      if (!ok) return
       window.location.reload()
       return
     }
 
-    const detail = bad
-      .map((r) => `· ${r.name}\n${renderReportSteps(r)}${r.error ? `\n   根因：${r.error}` : ''}`)
+    const blockerDetail = blockers
+      .map((r) => {
+        const tag = r.outcome === 'pending' ? '必挂起' : r.outcome === 'crash' ? '真实崩溃' : '异常'
+        return `· ${r.name}（${tag}）\n${renderReportSteps(r)}${r.error ? `\n   根因：${r.error}` : ''}`
+      })
       .join('\n')
-    pushLog('warn', `预检发现 ${bad.length} 个插件重载时可能崩（${bad.map((b) => b.name).join('、')}）`)
-    const warnMsg =
-      `重载界面前预检发现 ${bad.length} 个插件的 client 在刷新渲染进程时可能崩溃\n` +
-      `（静态存在性检查拦不住这类运行时错误，故在重载前先逐层执行冒烟验证）：\n\n` +
-      `${detail}`
+    const concernDetail = concernees
+      .map((r) => `· ${r.name}\n${renderReportSteps(r)}\n${(r.warns ?? []).filter((w) => !w.startsWith('实验室模式')).map((w) => `   ⚠ ${w}`).join('\n')}`)
+      .join('\n')
+    const msgParts: string[] = []
+    if (blockers.length > 0) {
+      msgParts.push(`· ${blockers.length} 个插件的 client 重载**将失败**（必挂起或真实崩溃，整页被门禁打回或白屏）：\n${blockerDetail}`)
+      pushLog('warn', `预检发现 ${blockers.length} 个插件重载将失败（${blockers.map((b) => b.name).join('、')}）`)
+    }
+    if (concernees.length > 0) {
+      msgParts.push(`· ${concernees.length} 个插件重载时可继续，但需关注（缺 client 产物或存在潜在缺陷）：\n${concernDetail}`)
+      pushLog('warn', `${concernees.length} 个插件重载需关注（${concernees.map((c) => c.name).join('、')}）`)
+    }
+    if (modeNotes.length > 0) {
+      msgParts.push(`· 模式说明：\n${modeNotes.map((w) => `   ⚠ ${w}`).join('\n')}`)
+    }
+    const warnMsg = `重载界面预检报告：\n\n${msgParts.join('\n\n')}`
     // 应用内弹窗确认（而非 window.confirm）：提供「复制报告」一键拷贝，便于去插件处定位修改。
+    // 与旧版一致：默认警示但允许继续重载。
     const proceed = await new Promise<boolean>((resolve) => setRiskAsk({ report: warnMsg, resolve }))
     if (!proceed) return
     pushLog('info', '用户选择继续：仍按原样重载界面')
@@ -614,14 +829,17 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   }
 
   const promote = async (p: Plugin): Promise<void> => {
-    if (!window.confirm(`真注入插件「${p.name}」？\n将安装其依赖闭包并写入 profile 装配清单，重启后持久生效（本次进程结束前仍为临时）。`)) {
-      return
-    }
+    const { ok } = await askConfirm({
+      title: '转正插件',
+      message: `真注入插件「${p.name}」？\n将安装其依赖闭包并写入 profile 装配清单，重启后持久生效（本次进程结束前仍为临时）。`,
+      okText: '确认转正',
+    })
+    if (!ok) return
     const { data: r, runId } = await withSteps<{ ok: boolean; error?: string; packageName?: string }>('promote', '转正插件', (rid) =>
       api(`${API}/promote`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: p.name, runId: rid }) }),
     )
     if (r.ok) {
-      notify(`已转正「${r.packageName ?? p.name}」，重启后生效`)
+      // 转正成功信息已在操作日志记录，不再弹顶部绿色提示。
       pushLog('ok', `已转正插件「${r.packageName ?? p.name}」，重启后生效`)
       await refresh()
     } else {
@@ -631,12 +849,17 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   }
 
   const tempRemove = async (p: Plugin): Promise<void> => {
-    if (!window.confirm(`卸载临时插件「${p.name}」？仅当前进程移除，不影响磁盘。`)) return
+    const { ok } = await askConfirm({
+      title: '卸载临时插件',
+      message: `卸载临时插件「${p.name}」？仅当前进程移除，不影响磁盘。`,
+      okText: '确认卸载',
+    })
+    if (!ok) return
     const { data: r, runId } = await withSteps<{ ok: boolean; error?: string }>('tempRemove', '卸载临时插件', (rid) =>
       api(`${API}/tempRemove`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: p.name, runId: rid }) }),
     )
     if (r.ok) {
-      notify('已卸载临时插件')
+      // 成功信息已在操作日志记录，不再弹顶部绿色提示。
       pushLog('ok', `已卸载临时插件 ${p.name}`)
       await refresh()
     } else {
@@ -646,18 +869,20 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   }
 
   const uninstall = async (p: Plugin): Promise<void> => {
-    if (
-      !window.confirm(
-        `真卸载插件「${p.name}」？\n将从磁盘移除包与依赖闭包、从装配清单注销并清理备注/分类——此操作不可通过面板撤销，重启后不再装配。\n确定继续吗？`,
-      )
-    )
-      return
+    const { ok, clearData } = await askConfirm({
+      title: '真卸载插件',
+      message: `将从磁盘移除「${p.name}」的包与依赖闭包、从装配清单注销并清理备注/分类——此操作不可通过面板撤销，重启后不再装配。\n确定继续吗？`,
+      okText: '确认卸载',
+      danger: true,
+      withClearData: true,
+    })
+    if (!ok) return
     const { data: r, runId } = await withSteps<{ ok: boolean; error?: string; packageName?: string }>('uninstall', '真卸载插件', (rid) =>
-      api(`${API}/uninstall`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: p.name, runId: rid }) }),
+      api(`${API}/uninstall`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id: p.name, runId: rid, clearData }) }),
     )
     if (r.ok) {
-      notify(`已卸载「${r.packageName ?? p.name}」`)
-      pushLog('ok', `已真卸载「${r.packageName ?? p.name}」`)
+      // 成功信息已在操作日志记录，不再弹顶部绿色提示。
+      pushLog('ok', `已真卸载「${r.packageName ?? p.name}」${clearData ? '，已清除本地数据目录' : ''}`)
       await refresh()
     } else {
       notify(r.error ?? '卸载失败')
@@ -714,7 +939,13 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   }
 
   const deleteFolder = async (f: Folder): Promise<void> => {
-    if (window.confirm(`删除文件夹「${f.name}」？其中的插件将移回「第三方插件」。`)) {
+    const { ok } = await askConfirm({
+      title: '删除文件夹',
+      message: `删除文件夹「${f.name}」？其中的插件将移回「第三方插件」。`,
+      okText: '确认删除',
+      danger: true,
+    })
+    if (ok) {
       if (await call('folders', { action: 'delete', id: f.id })) setActive('third')
     }
   }
@@ -727,6 +958,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
 
   return (
     <div style={s.root}>
+      <div style={s.stickyTop}>
       <div style={s.kernelBanner}>
         <span style={s.kernelCol}>
           <span style={s.kernelTitle}>{'当前内核版本'}</span>
@@ -755,11 +987,8 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
             {label}
           </button>
         ))}
-        <button style={s.tabClear} title="清空插件诊断/热插拔操作日志" onClick={() => {
-          if (logs.length === 0) return notify('暂无日志')
-          clearLogs()
-          notify('已清空日志')
-        }}>{'⧉ 清空日志'}</button>
+        <button style={s.tabClear} title="清空插件诊断/热插拔操作日志" onClick={() => { if (logs.length === 0) return; clearLogs() }}>{'⧉ 清空日志'}</button>
+      </div>
       </div>
 
       {tab === 'manage' && (
@@ -899,7 +1128,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
               onChange={(e) => setTempInput(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') void tempLoad()
-                if (e.key === 'Escape') setTempWanted(false)
+                if (e.key === 'Escape') setTempInput('')
               }}
             />
             <button style={s.ghostBtn} onClick={() => void startTempBrowse()} title="应用内浏览目录选择">{'浏览目录…'}</button>
@@ -907,6 +1136,25 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
               {tempBusy ? '加载中…' : '临时加载'}
             </button>
             <button style={s.reloadClientBtn} title="只刷新渲染进程，让热加载插件的 client 卡片立即显示（不重启内核）" onClick={reloadClient}>{'↻ 重载界面'}</button>
+            <div
+              role="switch"
+              aria-checked={preflightMode === 'real-cordis'}
+              style={s.preflightSwitch}
+              title={preflightMode === 'real-cordis'
+                ? '重载预检：实验室模式（开启）——真 cordis 门禁 + apply/渲染/数据驱动渲染全套 VM 检测，检测最全。点击关闭回默认。'
+                : '重载预检：默认模式（关闭）——仅三态门禁，不深挖 apply/渲染。点击开启实验室模式（检测最全，需确认）。'}
+              onClick={() => void setPreflightMode(preflightMode === 'real-cordis' ? 'three-state' : 'real-cordis')}
+            >
+              <span style={preflightMode === 'real-cordis' ? s.preflightSwitchTrackOn : s.preflightSwitchTrackOff}>
+                <span style={preflightMode === 'real-cordis' ? s.preflightSwitchKnobOn : s.preflightSwitchKnobOff} />
+              </span>
+              <span style={s.preflightSwitchLabel}>
+                {'实验室模式'}
+                <span style={s.preflightSwitchSub}>
+                  {preflightMode === 'real-cordis' ? '真 cordis 门禁·全套 VM 检测' : '三态门禁·仅门禁'}
+                </span>
+              </span>
+            </div>
           </div>
 
           <div style={s.logBox}>
@@ -915,7 +1163,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
               <span style={s.logCount}>{`${logs.length} 条`}</span>
               <span style={s.logActions}>
                 <button style={s.ghostBtnSm} onClick={copyLogs} title="复制整段日志到剪贴板">{'⧉ 复制日志'}</button>
-                <button style={s.ghostBtnSm} onClick={() => { if (logs.length) { clearLogs(); notify('已清空日志') } }} title="清空日志">{'清空'}</button>
+                <button style={s.ghostBtnSm} onClick={() => { if (logs.length) clearLogs() }} title="清空日志">{'清空'}</button>
               </span>
             </div>
             {steps && (
@@ -971,8 +1219,98 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
 
       {tab === 'diagnose' && (
         <div style={s.diagnosePanel}>
-          <div style={s.diagnoseTitle}>{'插件诊断'}</div>
-          <div style={s.diagnoseEmpty}>{'诊断功能开发中，敬请期待。后续将在此提供插件依赖闭包、路由占用、热装残留等运行期诊断。'}</div>
+          <div style={s.diagHead}>
+            <div style={s.diagHeadText}>
+              <span style={s.diagnoseTitle}>{'代码规范治理'}</span>
+              <span style={s.diagHint}>{'只读扫描已装第三方插件的编译产物（副本库），按《DSH 插件开发质量禁做清单》8 条逐项取证；不改任何源码与装配层。'}</span>
+            </div>
+            <button style={s.diagRunBtn} onClick={() => void runDiagnostics()} disabled={diagBusy}>
+              {diagBusy ? '体检中…' : '⛁ 一键体检'}
+            </button>
+          </div>
+
+          <div style={s.diagFolderBar}>
+            <span style={s.diagFolderLabel}>{'诊断范围'}</span>
+            <label style={s.diagChip}>
+              <input
+                type="checkbox"
+                checked={diagFolders.length === 0}
+                onChange={() => setDiagFolders([])}
+                style={s.checkbox}
+              />
+              <span>{'全部第三方'}</span>
+            </label>
+            {folders.map((f) => (
+              <label key={f.id} style={s.diagChip}>
+                <input
+                  type="checkbox"
+                  checked={diagFolders.includes(f.id)}
+                  onChange={() => toggleDiagFolder(f.id)}
+                  style={s.checkbox}
+                />
+                <span>{f.name}</span>
+              </label>
+            ))}
+          </div>
+
+          {diag.length === 0 ? (
+            <div style={s.diagnoseEmpty}>{'尚未体检。点击「一键体检」扫描全部第三方插件副本库，这里会按插件展示治理卡：✗ 违规 / ⚠ 疑点 均带证据行号与整改建议。'}</div>
+          ) : (
+            <div style={s.diagSummaryBar}>
+              <span style={s.diagSummaryText}>{`共体检 ${diag.length} 个插件`}</span>
+              <span style={s.diagSummaryEll}>
+                <span style={{ color: 'var(--dsw-color-error, #e74c3c)' }}>{`✗ 违规 ${diag.flatMap((p) => p.rules).filter((r) => r.level === 'err').length}`}</span>
+                <span style={{ color: 'var(--dsw-color-warning, #f39c12)' }}>{`⚠ 疑点 ${diag.flatMap((p) => p.rules).filter((r) => r.level === 'warn').length}`}</span>
+                <span style={{ color: 'var(--dsw-color-success, #27ae60)' }}>{`✓ 通过 ${diag.flatMap((p) => p.rules).filter((r) => r.level === 'ok').length}`}</span>
+              </span>
+              <button style={s.ghostBtnSm} onClick={copyDiagReport} title="复制全部非通过项的治理报告到剪贴板">{'⧉ 复制报告'}</button>
+            </div>
+          )}
+
+          <div style={s.diagList}>
+            {diag.map((p) => {
+              const issues = p.rules.filter((r) => r.level !== 'ok')
+              const err = p.rules.filter((r) => r.level === 'err').length
+              const warn = p.rules.filter((r) => r.level === 'warn').length
+              const face = err > 0 ? 'err' : warn > 0 ? 'warn' : 'ok'
+              const faceColor = face === 'err' ? 'var(--dsw-color-error, #e74c3c)' : face === 'warn' ? 'var(--dsw-color-warning, #f39c12)' : 'var(--dsw-color-success, #27ae60)'
+              return (
+                <div key={p.name} style={{ ...s.diagCard, borderLeft: `3px solid ${faceColor}` }}>
+                  <div style={s.diagCardHead}>
+                    <span style={s.diagCardName}>{p.name}</span>
+                    <span style={{ ...s.diagCardBadge, color: faceColor }}>{face === 'ok' ? '✓ 通过' : face === 'warn' ? '⚠ 有疑点' : '✗ 有违规'}</span>
+                    {p.runtime.phase === 'failed' && <span style={{ ...s.diagCardBadge, color: 'var(--dsw-color-error, #e74c3c)' }}>{'半挂(failed)'}</span>}
+                    <span style={s.diagCardMeta}>{`${p.scanned} 个文件 · 规则 ${p.rules.length} 条`}</span>
+                  </div>
+                  <div style={s.diagRuleList}>
+                    {issues.length === 0 ? (
+                      <span style={s.diagRuleDetail}>{'全部规则通过'}</span>
+                    ) : (
+                      issues.map((r) => (
+                        <div key={r.ruleId} style={s.diagRuleRow}>
+                          <span style={{ ...s.diagRuleMark, color: r.level === 'err' ? 'var(--dsw-color-error, #e74c3c)' : 'var(--dsw-color-warning, #f39c12)' }}>
+                            {r.level === 'err' ? '✗' : '⚠'}
+                          </span>
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div style={s.diagRuleTitle}>{`规则${r.ruleId} · ${r.title}`}</div>
+                            <div style={s.diagRuleDetail}>{r.detail}</div>
+                            {r.suggest && <div style={{ ...s.diagRuleDetail, color: 'var(--dsw-alias-label-tertiary)' }}>{`建议：${r.suggest}`}</div>}
+                            {r.evidence.map((ev, i) => (
+                              <div key={i} style={s.diagEvid} title={ev.snippet}>{
+                                ev.line
+                                  ? `📄 ${ev.file}:${ev.line}  ${ev.snippet}`
+                                  : `📄 ${ev.snippet}`
+                              }</div>
+                            ))}
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )
+            })}
+          </div>
         </div>
       )}
 
@@ -1067,12 +1405,40 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
           </div>
         </div>
       )}
+      {ask && (
+        <div style={s.modalMask} onClick={() => ask.resolve({ ok: false, clearData: askClearData })}>
+          <div style={s.modalPanel} onClick={(e) => e.stopPropagation()}>
+            <div style={s.modalHead}>
+              <span style={s.modalTitle}>{ask.title}</span>
+              <button style={s.iconBtnSm} title="取消" onClick={() => ask.resolve({ ok: false, clearData: askClearData })}>{'✕'}</button>
+            </div>
+            <div style={s.modalBody}>{ask.message}</div>
+            {ask.withClearData && (
+              <div style={s.checkboxRow}>
+                <input
+                  type="checkbox"
+                  checked={askClearData}
+                  onChange={(e) => setAskClearData(e.target.checked)}
+                  style={s.checkbox}
+                />
+                <span style={s.checkboxLabel}>{'同时清除该插件的本地配置与缓存（不可恢复）'}</span>
+              </div>
+            )}
+            <div style={s.modalFooter}>
+              <button style={s.ghostBtn} onClick={() => ask.resolve({ ok: false, clearData: askClearData })}>{'取消'}</button>
+              <button style={{ ...s.primaryBtn, ...(ask.danger ? s.dangerBtn : {}) }} onClick={() => ask.resolve({ ok: true, clearData: askClearData })}>
+                {ask.okText || '确认'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
 
-function folderOf(folders: Folder[], id: string): Folder | undefined {
-  return folders.find((f) => f.id === id)
+function folderOf(folders: Folder[] | undefined, id: string): Folder | undefined {
+  return folders?.find((f) => f.id === id)
 }
 
 interface RootProps {
@@ -1210,8 +1576,21 @@ function PluginCard(p: CardProps): JSX.Element {
   const badgeStyle =
     p.plugin.scope === 'official' ? s.badge : p.plugin.scope === 'shell' ? s.badgeShell : s.badgeThird
   const displayName = p.plugin.alias || p.plugin.name
-  const stateInfo = STATE_INFO[p.plugin.state ?? 'none']
-  const stateStyle = STATE_STYLE[p.plugin.state ?? 'none']
+  // 统一状态框：圆点 + 运行态文案 + 来源尾巴，颜色由运行态驱动；孤儿红色描边/尾巴隔离。
+  const runtimeInfo = RUNTIME_INFO[p.plugin.runtime]
+  const srcTail = SOURCE_TAIL[p.plugin.source]
+  const boxStyle = p.plugin.toggleable ? s.statusBoxClick : s.statusBox
+  const finalBoxStyle = p.plugin.source === 'orphan' ? { ...boxStyle, ...s.statusBoxOrphan } : boxStyle
+  const dotColor = RUNTIME_COLOR[p.plugin.runtime]
+  const textStyle = p.plugin.runtime === 'disabled' || p.plugin.runtime === 'none'
+    ? s.statusTextNeutral : { color: dotColor }
+  const srcStyle = (
+    p.plugin.source === 'orphan' ? s.statusSrcOrphan
+      : p.plugin.source === 'official' || p.plugin.source === 'shell' ? s.statusSrc
+      : s.statusSrc)
+  const clickTarget = p.plugin.toggleable
+    ? (e: MouseEvent<HTMLElement>) => { stop(e); p.onToggle() }
+    : undefined
 
   return (
     <div
@@ -1251,37 +1630,46 @@ function PluginCard(p: CardProps): JSX.Element {
       <div style={s.cardHead} onClick={stop}>
         <span style={badgeStyle}>{scopeLabel}</span>
         <span style={s.headRight}>
-          {p.plugin.hot === 'temporary' && (
-            <span style={s.tempBadge} title="运行时临时加载，重启即消失">{'临时'}</span>
+          {p.plugin.pendingRestart && (
+            <span style={s.noteChip} title="已转正为持久安装，重启后由装配清单加载">{'转正·待重启'}</span>
           )}
-          {p.plugin.hot === 'promoted' && (
-            <span style={s.promotedBadge} title="已转正为持久安装，重启后装配生效">{'待重启'}</span>
-          )}
-          {p.plugin.residual && (
-            <span style={s.residualBadge} title="本会话已卸载，装配/物理层待重启收敛；不可再无谓启停">{'已卸载'}</span>
-          )}
-          <span style={stateStyle}>{stateInfo}</span>
-          <label style={s.switchLabel} title={p.plugin.toggleable ? '点击启停' : '内置插件不可停用'}>
-            <input style={s.checkboxHidden} type="checkbox" checked={p.plugin.enabled} disabled={!p.plugin.toggleable} onChange={p.onToggle} />
-            <span style={{ ...s.switch, background: p.plugin.enabled ? 'var(--dsw-alias-state-business-primary)' : 'var(--dsw-alias-bg-layer-3)' }}>
-              <span style={{ ...s.knob, transform: p.plugin.enabled ? 'translateX(20px)' : 'translateX(0)' }} />
+          {p.plugin.toggleable ? (
+            <button
+              style={finalBoxStyle}
+              title={p.plugin.source === 'temporary' ? '运行时临时插件（重启即消失）· 点击启停' : '点击启停'}
+              onClick={clickTarget}
+            >
+              <span style={{ ...s.statusDot, background: dotColor }} />
+              <span style={textStyle}>{runtimeInfo}</span>
+              <span style={{ ...srcStyle, ...(p.plugin.source === 'orphan' ? s.statusSrcOrphan : {}) }}>
+                {`· ${srcTail}`}
+              </span>
+            </button>
+          ) : (
+            <span style={finalBoxStyle}>
+              <span style={{ ...s.statusDot, background: dotColor }} />
+              <span style={textStyle}>{runtimeInfo}</span>
+              <span style={{ ...srcStyle, ...(p.plugin.source === 'orphan' ? s.statusSrcOrphan : {}) }}>
+                {`· ${srcTail}`}
+              </span>
             </span>
-          </label>
-          {p.plugin.hot === 'temporary' && (
-            <>
-              <button style={s.promoteBtn} title="真注入：安装依赖并写入装配清单，重启后持久生效" onClick={p.onPromote}>{'转正'}</button>
-              <button style={s.tempRemoveBtn} title="卸载临时插件（仅当前进程，不影响磁盘）" onClick={p.onTempRemove}>{'✕'}</button>
-            </>
           )}
-          {p.plugin.hot === 'promoted' && (
-            <span style={s.promotedHint} title="重启后由装配清单持久加载；当前进程内原临时 entry 仍运行至退出">{'重启后持久生效'}</span>
+          {p.plugin.promoteable && (
+            <button style={s.promoteBtn} title="真注入：安装依赖并写入装配清单，重启后持久生效" onClick={p.onPromote}>{'转正'}</button>
           )}
-          {p.plugin.hot !== 'temporary' && !p.plugin.residual && p.plugin.scope === 'third' && p.plugin.toggleable && (
-            <button style={s.uninstallBtn} title="真卸载：移出磁盘、注销装配并清理备注/分类" onClick={(e) => {
-              stop(e)
-              p.onUninstall()
-            }}>
-              {'卸载'}
+          {p.plugin.tempRemoveable && (
+            <button style={s.tempRemoveBtn} title="卸载临时插件（仅当前进程，不影响磁盘）" onClick={p.onTempRemove}>{'✕'}</button>
+          )}
+          {p.plugin.removable && (
+            <button
+              style={s.uninstallBtn}
+              title={p.plugin.source === 'orphan' ? '清理孤儿残留（移出磁盘并注销装配）' : '真卸载：移出磁盘、注销装配并清理备注/分类'}
+              onClick={(e) => {
+                stop(e)
+                p.onUninstall()
+              }}
+            >
+              {p.plugin.source === 'orphan' ? '清理' : '卸载'}
             </button>
           )}
         </span>
@@ -1390,18 +1778,40 @@ function PluginCard(p: CardProps): JSX.Element {
   )
 }
 
-/** 运行时状态 → 文案。'none' 表示无活跃 fiber（如仅停用、未加载）。 */
-const STATE_INFO: Record<string, string> = {
+/** 运行态 → 文案。'none' 表示无活跃 fiber（如未装配/孤儿）。 */
+const RUNTIME_INFO: Record<string, string> = {
   active: '运行中',
+  disabled: '已停用',
   failed: '失败',
   pending: '待加载',
   loading: '加载中',
   disposed: '已卸载',
   unloading: '卸载中',
-  none: '未加载',
+  none: '未装配',
 }
 
-/** 统一徽标/状态胶囊的基础尺寸：卡片头部的第三方/临时/运行中/待重启/已卸载/转正/卸载/✕ 全部对齐。 */
+/** 来源轴尾巴 → 文案（状态框右侧细字）。 */
+const SOURCE_TAIL: Record<string, string> = {
+  official: '官方内置',
+  shell: '桌面壳',
+  temporary: '临时',
+  persistent: '持久',
+  orphan: '孤儿',
+}
+
+/** 运行态 → 主色（驱动状态框圆点 + 文案；disabled/none 走中性）。 */
+const RUNTIME_COLOR: Record<string, string> = {
+  active: 'var(--dsw-alias-state-success-primary)',
+  disabled: 'var(--dsw-alias-label-secondary)',
+  failed: 'var(--dsw-alias-state-danger-primary)',
+  pending: 'var(--dsw-alias-state-warning-primary)',
+  loading: 'var(--dsw-alias-label-secondary)',
+  disposed: 'var(--dsw-alias-label-secondary)',
+  unloading: 'var(--dsw-alias-label-secondary)',
+  none: 'var(--dsw-alias-label-tertiary)',
+}
+
+/** 统一徽标/状态胶囊的基础尺寸：状态框、scope 徽标、转正/✕/卸载/清理 全部对齐。 */
 const pillBase: CSSProperties = {
   display: 'inline-flex',
   alignItems: 'center',
@@ -1413,36 +1823,6 @@ const pillBase: CSSProperties = {
   fontWeight: 500,
   whiteSpace: 'nowrap',
   lineHeight: 1,
-}
-
-/** 运行时状态徽标的基础样式（先于 STATE_STYLE 定义）。 */
-const statePillBase: CSSProperties = {
-  ...pillBase,
-  fontFamily: 'var(--ds-font-family-code)',
-  color: 'var(--dsw-alias-label-secondary)',
-  background: 'var(--dsw-alias-bg-module-platform)',
-}
-
-/** 运行时状态 → 徽标样式（色彩语义：active=成功 / failed=危险 / 其它=中性）。 */
-const STATE_STYLE: Record<string, CSSProperties> = {
-  active: {
-    ...statePillBase,
-    color: 'var(--dsw-alias-state-success-primary)',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-success-primary) 13%, transparent)',
-  },
-  failed: {
-    ...statePillBase,
-    color: 'var(--dsw-alias-state-danger-primary)',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-danger-primary) 13%, transparent)',
-  },
-  pending: statePillBase,
-  loading: statePillBase,
-  disposed: statePillBase,
-  unloading: statePillBase,
-  none: {
-    ...statePillBase,
-    background: 'color-mix(in srgb, var(--dsw-alias-label-tertiary) 10%, transparent)',
-  },
 }
 
 /** 日志级别 → 文本颜色（ok=成功 / warn=警告 / err=危险 / 其它中性）。 */
@@ -1460,6 +1840,16 @@ const s: Record<string, CSSProperties> = {
   root: { display: 'flex', flexDirection: 'column', gap: 12, padding: 16, minHeight: 0 },
   center: { padding: 24, color: 'var(--dsw-alias-label-tertiary)', fontSize: 13, },
   // 顶部三栏导航
+  stickyTop: {
+    position: 'sticky',
+    top: 0,
+    zIndex: 40,
+    display: 'flex',
+    flexDirection: 'column',
+    gap: 8,
+    paddingBottom: 4,
+    background: 'var(--dsw-alias-bg-layer-0)',
+  },
   tabBar: {
     display: 'flex',
     alignItems: 'center',
@@ -1588,6 +1978,50 @@ const s: Record<string, CSSProperties> = {
   },
   diagnoseTitle: { fontSize: 15, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
   diagnoseEmpty: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', maxWidth: 420 },
+  diagFolderBar: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 },
+  diagFolderLabel: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', fontWeight: 500, marginRight: 2 },
+  diagChip: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: 4,
+    padding: '3px 8px',
+    borderRadius: 6,
+    fontSize: 12,
+    cursor: 'pointer',
+    background: 'var(--dsw-alias-bg-layer-2)',
+    border: '1px solid var(--dsw-alias-border-l1)',
+    color: 'var(--dsw-alias-label-secondary)',
+  },
+  // 代码规范治理面板
+  diagHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
+  diagHeadText: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
+  diagHint: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', maxWidth: 560 },
+  diagRunBtn: {
+    padding: '6px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer',
+    borderRadius: 6, whiteSpace: 'nowrap',
+    color: '#fff',
+    background: 'linear-gradient(135deg, #3b82f6, #8b5cf6)',
+    border: 'none',
+  },
+  diagSummaryBar: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', fontSize: 12 },
+  diagSummaryText: { color: 'var(--dsw-alias-label-primary)', fontWeight: 600 },
+  diagSummaryEll: { display: 'flex', gap: 12 },
+  diagList: { display: 'flex', flexDirection: 'column', gap: 10, overflow: 'auto', flex: 1, minHeight: 0 },
+  diagCard: {
+    display: 'flex', flexDirection: 'column', gap: 8, padding: 12,
+    borderRadius: 8, background: 'var(--dsw-alias-bg-layer-1)',
+    border: '1px solid var(--dsw-alias-border-l1)',
+  },
+  diagCardHead: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
+  diagCardName: { fontSize: 13, fontWeight: 700, color: 'var(--dsw-alias-label-primary)', fontFamily: 'monospace' },
+  diagCardBadge: { fontSize: 11, fontWeight: 600 },
+  diagCardMeta: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginLeft: 'auto' },
+  diagRuleList: { display: 'flex', flexDirection: 'column', gap: 6 },
+  diagRuleRow: { display: 'flex', gap: 8, alignItems: 'flex-start' },
+  diagRuleMark: { fontSize: 13, fontWeight: 700, lineHeight: '18px', width: 14, flexShrink: 0 },
+  diagRuleTitle: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
+  diagRuleDetail: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', marginTop: 2 },
+  diagEvid: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', background: 'var(--dsw-alias-bg-layer-2)', padding: '3px 6px', borderRadius: 4, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
   kernelBanner: {
     display: 'flex',
     alignItems: 'center',
@@ -1806,32 +2240,107 @@ const s: Record<string, CSSProperties> = {
     fontSize: 12,
     flexShrink: 0,
   },
-  headRight: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
-  tempBadge: {
-    ...pillBase,
-    color: 'var(--dsw-alias-state-business-primary)',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent)',
+  preflightSwitch: {
+    display: 'inline-flex',
+    alignItems: 'center',
+    gap: 7,
+    height: 32,
+    boxSizing: 'border-box',
+    padding: '0 9px',
+    borderRadius: 8,
+    border: '1px solid var(--dsw-alias-border-l2)',
+    background: 'var(--dsw-alias-bg-muted)',
+    cursor: 'pointer',
+    flexShrink: 0,
+    userSelect: 'none',
   },
-  promotedBadge: {
+  preflightSwitchTrackOn: {
+    position: 'relative',
+    width: 26,
+    height: 14,
+    borderRadius: 7,
+    boxSizing: 'border-box',
+    flexShrink: 0,
+    transition: 'background .15s ease',
+    background: 'var(--dsw-alias-state-success-primary)',
+  },
+  preflightSwitchTrackOff: {
+    position: 'relative',
+    width: 26,
+    height: 14,
+    borderRadius: 7,
+    boxSizing: 'border-box',
+    flexShrink: 0,
+    transition: 'background .15s ease',
+    background: 'var(--dsw-alias-border-l2)',
+  },
+  preflightSwitchKnobOn: {
+    position: 'absolute',
+    top: 1,
+    left: 13,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    background: '#fff',
+    boxShadow: '0 1px 2px rgba(0,0,0,.25)',
+    transition: 'left .15s ease',
+  },
+  preflightSwitchKnobOff: {
+    position: 'absolute',
+    top: 1,
+    left: 1,
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    background: '#fff',
+    boxShadow: '0 1px 2px rgba(0,0,0,.25)',
+    transition: 'left .15s ease',
+  },
+  preflightSwitchLabel: {
+    display: 'flex',
+    flexDirection: 'column',
+    alignItems: 'flex-start',
+    lineHeight: 1.1,
+    color: 'var(--dsw-alias-label-primary)',
+    fontSize: 12,
+    whiteSpace: 'nowrap',
+  },
+  preflightSwitchSub: {
+    fontSize: 10,
+    color: 'var(--dsw-alias-label-secondary)',
+    whiteSpace: 'nowrap',
+  },
+  headRight: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
+  noteChip: {
     ...pillBase,
+    fontFamily: 'var(--ds-font-family-code)',
     color: 'var(--dsw-alias-state-warning-primary)',
     background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 14%, transparent)',
     border: '1px dashed var(--dsw-alias-state-warning-primary)',
   },
-  residualBadge: {
+  statusBox: {
     ...pillBase,
-    color: 'var(--dsw-alias-label-tertiary)',
-    background: 'color-mix(in srgb, var(--dsw-alias-label-tertiary) 12%, transparent)',
+    fontFamily: 'var(--ds-font-family-code)',
+    gap: 6,
+    background: 'var(--dsw-alias-bg-module-platform)',
     border: '1px solid transparent',
-    textDecoration: 'line-through',
   },
-  promotedHint: {
-    fontSize: 12,
-    fontWeight: 500,
-    color: 'var(--dsw-alias-state-warning-primary)',
-    opacity: 0.85,
-    whiteSpace: 'nowrap',
+  statusBoxClick: {
+    ...pillBase,
+    fontFamily: 'var(--ds-font-family-code)',
+    gap: 6,
+    background: 'var(--dsw-alias-bg-module-platform)',
+    border: '1px solid var(--dsw-alias-border-l2)',
+    cursor: 'pointer',
+    transition: 'border-color 0.12s ease, box-shadow 0.12s ease',
   },
+  statusBoxOrphan: {
+    borderColor: 'var(--dsw-alias-state-danger-primary)',
+  },
+  statusDot: { width: 8, height: 8, borderRadius: 999, flexShrink: 0, display: 'inline-block' },
+  statusTextNeutral: { color: 'var(--dsw-alias-label-secondary)' },
+  statusSrc: { opacity: 0.6, whiteSpace: 'nowrap' },
+  statusSrcOrphan: { color: 'var(--dsw-alias-state-danger-primary)', opacity: 1 },
   tempRemoveBtn: {
     ...pillBase,
     color: 'var(--dsw-alias-state-danger-primary)',
@@ -2055,4 +2564,10 @@ const s: Record<string, CSSProperties> = {
   },
   modalHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
   modalTitle: { fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
+  modalBody: { fontSize: 13, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.6, whiteSpace: 'pre-wrap' },
+  modalFooter: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 },
+  checkboxRow: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 },
+  checkbox: { width: 14, height: 14, accentColor: 'var(--dsw-color-primary)', flexShrink: 0 },
+  checkboxLabel: { fontSize: 13, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.4 },
+  dangerBtn: { background: 'var(--dsw-alias-state-danger-primary, #e74c3c)' },
 }
