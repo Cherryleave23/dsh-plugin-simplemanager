@@ -7,6 +7,8 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { CSSProperties, MouseEvent } from 'react'
+import { s, logStyle } from './client-styles'
+import { FolderRow, PluginCard, folderOf, dragName, dragKind, dragPhase, browserDragging } from './client-rows'
 
 export const name = 'dsh-plugin-simplemanager'
 export const inject = ['slots']
@@ -30,14 +32,14 @@ interface KernelInfo {
   source: string
 }
 
-interface Folder {
+export interface Folder {
   id: string
   name: string
   kind: 'official' | 'third' | 'custom'
   count: number
 }
 
-interface Plugin {
+export interface Plugin {
   name: string
   version: string
   description: string
@@ -133,6 +135,8 @@ interface StepView {
 }
 let stepView: StepView | null = null
 let logSubscribe: (() => void) | null = null
+/** 当前活跃的步骤轮询 interval（单活：新操作顶掉旧的，防僵尸轮询叠加）。 */
+let pollTimer: number | undefined
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(path, init)
@@ -202,16 +206,6 @@ export function apply(ctx: AppClientContext): void {
   )
 }
 
-/** 模块级拖拽信号（纯命令式，不参与渲染）：来源 id 与类型，供子组件 FolderRow/PluginCard 判定落点行为。 */
-const dragName = { current: '' as string }
-const dragKind = { current: '' as 'plugin' | 'folder' | '' }
-/** 拖拽悬停目标上的落点相位：目标中点前半=插入到其前，后半=插入到其后。 */
-const dragPhase = { current: 'before' as 'before' | 'after' }
-
-function browserDragging(): boolean {
-  return dragKind.current !== ''
-}
-
 function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const [ready, setReady] = useState(false)
   const [folders, setFolders] = useState<Folder[]>([])
@@ -264,8 +258,10 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const refresh = useCallback(async () => {
     const view = await browse()
     const kb = await api<KernelInfo>(`${API}/kernel`)
-    setFolders(view.folders)
-    setPlugins(view.plugins)
+    // 摄取点形态归一化：服务端异常响应（半写状态/降级/字段缺失）不得带崩整面板（B2 类防御，
+    // data-render 用异常数据形态压测的就是这里）。Array.isArray 而非 ?? —— 非数组成员同样要拦。
+    setFolders(Array.isArray(view?.folders) ? view.folders : [])
+    setPlugins(Array.isArray(view?.plugins) ? view.plugins : [])
     setKernel(kb)
     setReady(true)
   }, [])
@@ -437,10 +433,11 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
         pushLog('err', `代码规范体检失败：${r.error ?? '未知原因'}`)
         return
       }
-      setDiag(r.report)
-      const err = r.report.flatMap((p) => p.rules).filter((x) => x.level === 'err').length
-      const warn = r.report.flatMap((p) => p.rules).filter((x) => x.level === 'warn').length
-      pushLog(err || warn ? 'warn' : 'ok', `体检完成：${r.report.length} 个插件 · 违规 ${err} 项 / 疑点 ${warn} 项`)
+      const report = Array.isArray(r.report) ? r.report : []
+      setDiag(report)
+      const err = report.flatMap((p) => p.rules ?? []).filter((x) => x.level === 'err').length
+      const warn = report.flatMap((p) => p.rules ?? []).filter((x) => x.level === 'warn').length
+      pushLog(err || warn ? 'warn' : 'ok', `体检完成：${report.length} 个插件 · 违规 ${err} 项 / 疑点 ${warn} 项`)
     } catch (e) {
       notify('体检请求失败')
       pushLog('err', `代码规范体检请求异常：${String(e)}`)
@@ -454,7 +451,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     if (list.length === 0) return '（尚未进行体检，或当前无诊断结果）'
     const out: string[] = []
     for (const p of list) {
-      const issues = p.rules.filter((r) => r.level !== 'ok')
+      const issues = (p.rules ?? []).filter((r) => r.level !== 'ok')
       out.push(`## ${p.name}${p.pkgDir ? `\n副本：${p.pkgDir}` : ''}${p.runtime.phase === 'failed' ? '\n⚠ 运行态：failed（启动失败，需重装）' : ''}`)
       if (issues.length === 0) {
         out.push('✓ 全部规则通过')
@@ -648,8 +645,11 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
       throw error
     }
   }
-  /** 延后启动轮询（不与 withSteps 的同步路径耦合），每间隔拉一次快照增量更新 stepView。 */
+  /** 延后启动轮询（不与 withSteps 的同步路径耦合），每间隔拉一次快照增量更新 stepView。
+   * 单活轮询：新操作顶掉旧轮询；runId 失配的旧轮询自杀清 interval——否则切换操作后旧 interval
+   * 永远每 400ms 打一次 /steps 接口（僵尸轮询），多次快速操作还会叠加多个 interval。 */
   const pollSteps = (runId: string): void => {
+    if (pollTimer !== undefined) window.clearInterval(pollTimer)
     const timer = window.setInterval(async () => {
       const snap = await fetchSteps(runId)
       if (!snap.ok) return
@@ -657,7 +657,11 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
         stepView = { runId, plan: snap.plan, states: {}, done: snap.done ?? false, title: stepView?.title ?? '操作' }
       }
       const cur = stepView
-      if (!cur || cur.runId !== runId) return
+      if (!cur || cur.runId !== runId) {
+        window.clearInterval(timer)
+        if (pollTimer === timer) pollTimer = undefined
+        return
+      }
       const states = { ...cur.states }
       for (const s of snap.states ?? []) {
         const prev = states[s.key]
@@ -673,6 +677,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
       cur.done = snap.done ?? cur.done
       if (cur.done) {
         window.clearInterval(timer)
+        if (pollTimer === timer) pollTimer = undefined
         snap.lines?.forEach((l) => pushLog(mapStepLevel(l.level), l.text))
         setSteps(cur)
       } else {
@@ -680,6 +685,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
         setSteps(cur)
       }
     }, 400)
+    pollTimer = timer
   }
 
   /** 重载 CLIENT 层前，对「活跃插件」做无头冒烟预检请求（kernel 进程真实执行 client bundle 的 load 注册 + apply）。
@@ -691,15 +697,15 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ names, mode }),
       })
-      return r.results ?? []
+      return Array.isArray(r.results) ? r.results : []
     } catch {
       return []
     }
   }
 
-  /** 展开一条预检报告的每步详情（1 行 1 步，缩进对齐），ok=false 那步即重载崩根因。 */
+  /** 展开一条预检报告的有问题步骤明细（只列 ok=false 的步；其余通过步不再占行，避免噪音）。 */
   const renderReportSteps = (r: ClientSmokeReport): string =>
-    r.steps.map((s) => `   ${s.ok ? '✓' : '✗'} ${s.name}：${s.detail}`).join('\n')
+    (r.steps ?? []).filter((s) => !s.ok).map((s) => `   ✗ ${s.name}：${s.detail}`).join('\n')
 
   /** 重载 CLIENT 层：先对活跃插件做无头冒烟预检，抓到「热注入没问题、但重载前端会崩」的插件就警告并列分步根因，
    * 当前策略为「警告 + 仍允许重载」（硬阻止为未来方向）。静态存在性检查拦不住这类运行时错误，只能靠冒烟预检。 */
@@ -1259,9 +1265,9 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
             <div style={s.diagSummaryBar}>
               <span style={s.diagSummaryText}>{`共体检 ${diag.length} 个插件`}</span>
               <span style={s.diagSummaryEll}>
-                <span style={{ color: 'var(--dsw-color-error, #e74c3c)' }}>{`✗ 违规 ${diag.flatMap((p) => p.rules).filter((r) => r.level === 'err').length}`}</span>
-                <span style={{ color: 'var(--dsw-color-warning, #f39c12)' }}>{`⚠ 疑点 ${diag.flatMap((p) => p.rules).filter((r) => r.level === 'warn').length}`}</span>
-                <span style={{ color: 'var(--dsw-color-success, #27ae60)' }}>{`✓ 通过 ${diag.flatMap((p) => p.rules).filter((r) => r.level === 'ok').length}`}</span>
+                <span style={{ color: 'var(--dsw-color-error, #e74c3c)' }}>{`✗ 违规 ${diag.flatMap((p) => p.rules ?? []).filter((r) => r.level === 'err').length}`}</span>
+                <span style={{ color: 'var(--dsw-color-warning, #f39c12)' }}>{`⚠ 疑点 ${diag.flatMap((p) => p.rules ?? []).filter((r) => r.level === 'warn').length}`}</span>
+                <span style={{ color: 'var(--dsw-color-success, #27ae60)' }}>{`✓ 通过 ${diag.flatMap((p) => p.rules ?? []).filter((r) => r.level === 'ok').length}`}</span>
               </span>
               <button style={s.ghostBtnSm} onClick={copyDiagReport} title="复制全部非通过项的治理报告到剪贴板">{'⧉ 复制报告'}</button>
             </div>
@@ -1269,9 +1275,9 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
 
           <div style={s.diagList}>
             {diag.map((p) => {
-              const issues = p.rules.filter((r) => r.level !== 'ok')
-              const err = p.rules.filter((r) => r.level === 'err').length
-              const warn = p.rules.filter((r) => r.level === 'warn').length
+              const issues = (p.rules ?? []).filter((r) => r.level !== 'ok')
+              const err = (p.rules ?? []).filter((r) => r.level === 'err').length
+              const warn = (p.rules ?? []).filter((r) => r.level === 'warn').length
               const face = err > 0 ? 'err' : warn > 0 ? 'warn' : 'ok'
               const faceColor = face === 'err' ? 'var(--dsw-color-error, #e74c3c)' : face === 'warn' ? 'var(--dsw-color-warning, #f39c12)' : 'var(--dsw-color-success, #27ae60)'
               return (
@@ -1437,1137 +1443,3 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   )
 }
 
-function folderOf(folders: Folder[] | undefined, id: string): Folder | undefined {
-  return folders?.find((f) => f.id === id)
-}
-
-interface RootProps {
-  folder: Folder
-  active: boolean
-  hover: boolean
-  onSelect(): void
-  onDrop(phase: 'before' | 'after'): void
-  onHoverChange(hovering: boolean): void
-  onDragStart(): void
-  onDragEnd(): void
-  onRename(nameText: string): void
-  onDelete(): void
-}
-
-function FolderRow(p: RootProps): JSX.Element {
-  const [editing, setEditing] = useState(false)
-  const [nameText, setNameText] = useState(p.folder.name)
-
-  const commit = (): void => {
-    setEditing(false)
-    p.onRename(nameText)
-  }
-
-  return (
-    <div
-      style={{ ...s.folder, ...(p.active ? s.folderActive : {}), ...(p.hover ? s.folderOver : {}) }}
-      draggable={p.folder.kind === 'custom'}
-      onDragStart={p.onDragStart}
-      onDragEnd={p.onDragEnd}
-      onDragEnter={(e) => {
-        if (!dragKind.current) return
-        e.preventDefault()
-        const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-        dragPhase.current = e.clientY < r.top + r.height / 2 ? 'before' : 'after'
-        p.onHoverChange(true)
-      }}
-      onDragLeave={() => p.onHoverChange(false)}
-      onDragOver={(e) => {
-        if (!dragKind.current) return
-        e.preventDefault()
-        const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-        dragPhase.current = e.clientY < r.top + r.height / 2 ? 'before' : 'after'
-      }}
-      onDrop={(e) => {
-        if (!dragKind.current) return
-        e.preventDefault()
-        p.onDrop(dragPhase.current)
-      }}
-      onClick={p.onSelect}
-    >
-      {editing ? (
-        <input
-          style={{ ...s.input, width: '100%', margin: 0 }}
-          autoFocus
-          value={nameText}
-          onChange={(e) => setNameText(e.target.value)}
-          onBlur={commit}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') commit()
-          }}
-          onClick={(e) => e.stopPropagation()}
-        />
-      ) : (
-        <>
-          <span style={s.folderName} title={p.folder.name}>{p.folder.name}</span>
-          {p.folder.kind === 'custom' && (
-            <span style={s.folderActions}>
-              <button
-                style={s.iconBtnSm}
-                title="重命名"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  setEditing(true)
-                }}
-              >
-                {'✎'}
-              </button>
-              <button
-                style={s.iconBtnSm}
-                title="删除"
-                onClick={(e) => {
-                  e.stopPropagation()
-                  p.onDelete()
-                }}
-              >
-                {'✕'}
-              </button>
-            </span>
-          )}
-        </>
-      )}
-      <span style={s.folderCount}>{p.folder.count}</span>
-    </div>
-  )
-}
-
-interface CardProps {
-  plugin: Plugin
-  hover: boolean
-  phase: '' | 'before' | 'after'
-  onHoverChange(hovering: boolean): void
-  onPhaseChange(phase: 'before' | 'after'): void
-  onDragStart(): void
-  onDragEnd(): void
-  onDropBefore(phase: 'before' | 'after'): void
-  onToggle(): void
-  onSaveNote(note: string): void
-  onRename(alias: string): void
-  onPromote(): void
-  onTempRemove(): void
-  onUninstall(): void
-}
-
-function PluginCard(p: CardProps): JSX.Element {
-  const [editing, setEditing] = useState(false)
-  const [noteText, setNoteText] = useState(p.plugin.note)
-  const [renaming, setRenaming] = useState(false)
-  const [aliasText, setAliasText] = useState(p.plugin.alias)
-  const [showDeps, setShowDeps] = useState(false)
-
-  const stop = (e: MouseEvent<HTMLElement>): void => e.stopPropagation()
-
-  const commit = (): void => {
-    setEditing(false)
-    p.onSaveNote(noteText)
-  }
-
-  const commitAlias = (): void => {
-    setRenaming(false)
-    p.onRename(aliasText)
-  }
-
-  const scopeLabel = p.plugin.scope === 'official' ? '官方' : p.plugin.scope === 'shell' ? '壳' : '第三方'
-  const badgeStyle =
-    p.plugin.scope === 'official' ? s.badge : p.plugin.scope === 'shell' ? s.badgeShell : s.badgeThird
-  const displayName = p.plugin.alias || p.plugin.name
-  // 统一状态框：圆点 + 运行态文案 + 来源尾巴，颜色由运行态驱动；孤儿红色描边/尾巴隔离。
-  const runtimeInfo = RUNTIME_INFO[p.plugin.runtime]
-  const srcTail = SOURCE_TAIL[p.plugin.source]
-  const boxStyle = p.plugin.toggleable ? s.statusBoxClick : s.statusBox
-  const finalBoxStyle = p.plugin.source === 'orphan' ? { ...boxStyle, ...s.statusBoxOrphan } : boxStyle
-  const dotColor = RUNTIME_COLOR[p.plugin.runtime]
-  const textStyle = p.plugin.runtime === 'disabled' || p.plugin.runtime === 'none'
-    ? s.statusTextNeutral : { color: dotColor }
-  const srcStyle = (
-    p.plugin.source === 'orphan' ? s.statusSrcOrphan
-      : p.plugin.source === 'official' || p.plugin.source === 'shell' ? s.statusSrc
-      : s.statusSrc)
-  const clickTarget = p.plugin.toggleable
-    ? (e: MouseEvent<HTMLElement>) => { stop(e); p.onToggle() }
-    : undefined
-
-  return (
-    <div
-      style={{ ...s.card, ...(p.hover ? s.cardOver : {}) }}
-      draggable
-      onDragStart={p.onDragStart}
-      onDragEnd={p.onDragEnd}
-      onDragEnter={(e) => {
-        if (dragKind.current !== 'plugin') return
-        e.preventDefault()
-        const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-        const ph = e.clientX < r.left + r.width / 2 ? 'before' : 'after'
-        dragPhase.current = ph
-        p.onHoverChange(true)
-      }}
-      onDragLeave={() => {
-        if (dragKind.current === 'plugin') p.onHoverChange(false)
-      }}
-      onDragOver={(e) => {
-        if (dragKind.current !== 'plugin') return
-        e.preventDefault()
-        const r = (e.currentTarget as HTMLElement).getBoundingClientRect()
-        const ph = e.clientX < r.left + r.width / 2 ? 'before' : 'after'
-        dragPhase.current = ph
-        p.onPhaseChange(ph)
-      }}
-      onDrop={(e) => {
-        if (dragKind.current !== 'plugin') return
-        e.preventDefault()
-        p.onDropBefore(dragPhase.current)
-      }}
-      onClick={() => setShowDeps((v) => !v)}
-    >
-      {p.hover && p.phase && (
-        <div style={{ ...s.dropLine, ...(p.phase === 'after' ? { left: 'calc(100% - 2px)' } : { left: 0 }) }} />
-      )}
-      <div style={s.cardHead} onClick={stop}>
-        <span style={badgeStyle}>{scopeLabel}</span>
-        <span style={s.headRight}>
-          {p.plugin.pendingRestart && (
-            <span style={s.noteChip} title="已转正为持久安装，重启后由装配清单加载">{'转正·待重启'}</span>
-          )}
-          {p.plugin.toggleable ? (
-            <button
-              style={finalBoxStyle}
-              title={p.plugin.source === 'temporary' ? '运行时临时插件（重启即消失）· 点击启停' : '点击启停'}
-              onClick={clickTarget}
-            >
-              <span style={{ ...s.statusDot, background: dotColor }} />
-              <span style={textStyle}>{runtimeInfo}</span>
-              <span style={{ ...srcStyle, ...(p.plugin.source === 'orphan' ? s.statusSrcOrphan : {}) }}>
-                {`· ${srcTail}`}
-              </span>
-            </button>
-          ) : (
-            <span style={finalBoxStyle}>
-              <span style={{ ...s.statusDot, background: dotColor }} />
-              <span style={textStyle}>{runtimeInfo}</span>
-              <span style={{ ...srcStyle, ...(p.plugin.source === 'orphan' ? s.statusSrcOrphan : {}) }}>
-                {`· ${srcTail}`}
-              </span>
-            </span>
-          )}
-          {p.plugin.promoteable && (
-            <button style={s.promoteBtn} title="真注入：安装依赖并写入装配清单，重启后持久生效" onClick={p.onPromote}>{'转正'}</button>
-          )}
-          {p.plugin.tempRemoveable && (
-            <button style={s.tempRemoveBtn} title="卸载临时插件（仅当前进程，不影响磁盘）" onClick={p.onTempRemove}>{'✕'}</button>
-          )}
-          {p.plugin.removable && (
-            <button
-              style={s.uninstallBtn}
-              title={p.plugin.source === 'orphan' ? '清理孤儿残留（移出磁盘并注销装配）' : '真卸载：移出磁盘、注销装配并清理备注/分类'}
-              onClick={(e) => {
-                stop(e)
-                p.onUninstall()
-              }}
-            >
-              {p.plugin.source === 'orphan' ? '清理' : '卸载'}
-            </button>
-          )}
-        </span>
-      </div>
-
-      {renaming ? (
-        <input
-          style={{ ...s.input, width: '100%' }}
-          autoFocus
-          value={aliasText}
-          placeholder={p.plugin.name}
-          onClick={stop}
-          onChange={(e) => setAliasText(e.target.value)}
-          onBlur={commitAlias}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter') commitAlias()
-            if (e.key === 'Escape') setRenaming(false)
-          }}
-        />
-      ) : (
-        <div style={s.cardTitleRow}>
-          <div
-            style={s.cardName}
-            title="双击重命名"
-            onDoubleClick={(e) => {
-              stop(e)
-              setAliasText(p.plugin.alias)
-              setRenaming(true)
-            }}
-          >
-            {displayName}
-          </div>
-          <span
-            style={{ ...s.depsCount, color: showDeps ? 'var(--dsw-alias-state-business-primary)' : 'var(--dsw-alias-label-tertiary)' }}
-            title={showDeps ? '收起依赖' : '点击展开查看依赖'}
-            onClick={(e) => {
-              stop(e)
-              setShowDeps((v) => !v)
-            }}
-          >
-            {p.plugin.dependencies.length > 0 ? `${showDeps ? '▾' : '▸'} 依赖 ${p.plugin.dependencies.length}` : '依赖 0'}
-          </span>
-          <button
-            style={s.iconBtnSm}
-            title="自定义显示名（也可双击插件名）"
-            onClick={(e) => {
-              stop(e)
-              setAliasText(p.plugin.alias)
-              setRenaming(true)
-            }}
-          >
-            {'✎'}
-          </button>
-        </div>
-      )}
-
-      <div style={s.cardVersion}>{p.plugin.alias ? `${p.plugin.name} · v${p.plugin.version}` : `v${p.plugin.version}`}</div>
-
-      <div style={s.cardMeta}>
-        {p.plugin.description ? <div style={s.cardDesc}>{p.plugin.description}</div> : <div style={s.cardDescMuted}>{'（无描述）'}</div>}
-      </div>
-
-      {showDeps && (
-        <div style={s.depsBox}>
-          <div style={s.depsTitle}>{`声明的依赖（${p.plugin.dependencies.length}）`}</div>
-          {p.plugin.dependencies.length === 0 ? (
-            <div style={s.depsEmpty}>{'该插件未声明 dependencies / peerDependencies'}</div>
-          ) : (
-            <div style={s.depsList} onClick={(e) => e.stopPropagation()}>
-              {p.plugin.dependencies.map((d) => (
-                <code key={d} style={s.depsItem}>{d}</code>
-              ))}
-            </div>
-          )}
-        </div>
-      )}
-
-      <div style={s.noteBox}>
-        {editing ? (
-          <textarea
-            style={s.noteTextarea}
-            autoFocus
-            rows={2}
-            value={noteText}
-            placeholder="添加备注…"
-            onClick={stop}
-            onChange={(e) => setNoteText(e.target.value)}
-            onBlur={commit}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') {
-                e.preventDefault()
-                commit()
-              }
-            }}
-          />
-        ) : (
-          <button style={s.noteText} title="点击编辑备注" onClick={(e) => {
-            stop(e)
-            setEditing(true)
-          }}>
-            {p.plugin.note ? p.plugin.note : '＋ 添加备注'}
-          </button>
-        )}
-      </div>
-    </div>
-  )
-}
-
-/** 运行态 → 文案。'none' 表示无活跃 fiber（如未装配/孤儿）。 */
-const RUNTIME_INFO: Record<string, string> = {
-  active: '运行中',
-  disabled: '已停用',
-  failed: '失败',
-  pending: '待加载',
-  loading: '加载中',
-  disposed: '已卸载',
-  unloading: '卸载中',
-  none: '未装配',
-}
-
-/** 来源轴尾巴 → 文案（状态框右侧细字）。 */
-const SOURCE_TAIL: Record<string, string> = {
-  official: '官方内置',
-  shell: '桌面壳',
-  temporary: '临时',
-  persistent: '持久',
-  orphan: '孤儿',
-}
-
-/** 运行态 → 主色（驱动状态框圆点 + 文案；disabled/none 走中性）。 */
-const RUNTIME_COLOR: Record<string, string> = {
-  active: 'var(--dsw-alias-state-success-primary)',
-  disabled: 'var(--dsw-alias-label-secondary)',
-  failed: 'var(--dsw-alias-state-danger-primary)',
-  pending: 'var(--dsw-alias-state-warning-primary)',
-  loading: 'var(--dsw-alias-label-secondary)',
-  disposed: 'var(--dsw-alias-label-secondary)',
-  unloading: 'var(--dsw-alias-label-secondary)',
-  none: 'var(--dsw-alias-label-tertiary)',
-}
-
-/** 统一徽标/状态胶囊的基础尺寸：状态框、scope 徽标、转正/✕/卸载/清理 全部对齐。 */
-const pillBase: CSSProperties = {
-  display: 'inline-flex',
-  alignItems: 'center',
-  height: 20,
-  boxSizing: 'border-box',
-  padding: '0 7px',
-  borderRadius: 5,
-  fontSize: 12,
-  fontWeight: 500,
-  whiteSpace: 'nowrap',
-  lineHeight: 1,
-}
-
-/** 日志级别 → 文本颜色（ok=成功 / warn=警告 / err=危险 / 其它中性）。 */
-const LOG_COLOR: Record<string, string> = {
-  ok: 'var(--dsw-alias-state-success-primary)',
-  warn: 'var(--dsw-alias-state-warning-primary)',
-  err: 'var(--dsw-alias-state-danger-primary)',
-}
-
-function logStyle(level: 'info' | 'ok' | 'warn' | 'err'): CSSProperties {
-  return { ...s.logText, ...(LOG_COLOR[level] ? { color: LOG_COLOR[level] } : {}) }
-}
-
-const s: Record<string, CSSProperties> = {
-  root: { display: 'flex', flexDirection: 'column', gap: 12, padding: 16, minHeight: 0 },
-  center: { padding: 24, color: 'var(--dsw-alias-label-tertiary)', fontSize: 13, },
-  // 顶部三栏导航
-  stickyTop: {
-    position: 'sticky',
-    top: 0,
-    zIndex: 40,
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 8,
-    paddingBottom: 4,
-    background: 'var(--dsw-alias-bg-layer-0)',
-  },
-  tabBar: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 6,
-    padding: '4px',
-    borderRadius: 10,
-    background: 'var(--dsw-alias-bg-layer-1)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    boxShadow: 'var(--dsw-shadow-lv1)',
-  },
-  tabBtn: {
-    border: 'none',
-    background: 'transparent',
-    color: 'var(--dsw-alias-label-secondary)',
-    borderRadius: 7,
-    padding: '6px 16px',
-    cursor: 'pointer',
-    fontSize: 13, fontWeight: 500,
-    transition: 'background 0.15s ease, color 0.15s ease',
-  },
-  tabBtnActive: {
-    background: 'color-mix(in srgb, var(--dsw-alias-state-business-primary) 14%, transparent)',
-    color: 'var(--dsw-alias-state-business-primary)',
-  },
-  tabClear: {
-    marginLeft: 'auto',
-    border: '1px solid var(--dsw-alias-border-l2)',
-    background: 'transparent',
-    color: 'var(--dsw-alias-label-tertiary)',
-    borderRadius: 6,
-    padding: '4px 10px',
-    cursor: 'pointer',
-    fontSize: 11,
-    flexShrink: 0,
-  },
-  // 热插拔面板
-  hotswapPanel: { display: 'flex', flexDirection: 'column', gap: 12, minHeight: 0, flex: 1 },
-  hotswapHead: { display: 'flex', flexDirection: 'column', gap: 4 },
-  hotswapTitle: { fontSize: 15, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
-  hotswapHint: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)' },
-  // 日志区
-  logBox: {
-    display: 'flex',
-    flexDirection: 'column',
-    minHeight: 0,
-    flex: 1,
-    borderRadius: 10,
-    background: 'var(--dsw-alias-bg-layer-1)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    boxShadow: 'var(--dsw-shadow-lv1)',
-    overflow: 'hidden',
-  },
-  logHead: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    padding: '8px 12px',
-    borderBottom: '1px solid var(--dsw-alias-border-l2)',
-  },
-  logTitle: { fontSize: 13, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
-  logCount: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' },
-  logActions: { marginLeft: 'auto', display: 'flex', gap: 6 },
-  ghostBtnSm: {
-    border: '1px solid var(--dsw-alias-border-l2)',
-    background: 'transparent',
-    color: 'var(--dsw-alias-label-secondary)',
-    borderRadius: 6,
-    height: 28,
-    boxSizing: 'border-box',
-    padding: '0 12px',
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    cursor: 'pointer',
-    fontSize: 12,
-    flexShrink: 0,
-  },
-  logView: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 2,
-    minHeight: 0,
-    flex: 1,
-    overflowY: 'auto',
-    padding: '8px 12px',
-    fontFamily: 'var(--ds-font-family-code)',
-    fontSize: 12,
-  },
-  logRow: { display: 'flex', gap: 10, lineHeight: '19px' },
-  logTime: { flexShrink: 0, color: 'var(--dsw-alias-label-tertiary)' },
-  logText: { whiteSpace: 'pre-wrap', wordBreak: 'break-word' },
-  logEmpty: { color: 'var(--dsw-alias-label-tertiary)', fontSize: 12, lineHeight: '20px' },
-  // 步骤骨架 + 实时跟踪
-  stepBox: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 6,
-    padding: '8px 12px',
-    borderBottom: '1px solid var(--dsw-alias-border-l2)',
-  },
-  stepHead: { display: 'flex', alignItems: 'center', gap: 8 },
-  stepTitle: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
-  stepHint: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginLeft: 'auto' },
-  stepList: { display: 'flex', flexDirection: 'column', gap: 4 },
-  stepRow: { display: 'flex', alignItems: 'center', gap: 7, fontSize: 12, lineHeight: '18px' },
-  stepIcon: { display: 'inline-flex', width: 14, justifyContent: 'center', fontSize: 12, flexShrink: 0 },
-  stepIconRunning: { animation: 'smStepPulse 1.2s ease-in-out infinite' },
-  stepLabel: { color: 'var(--dsw-alias-label-primary)', fontWeight: 500 },
-  stepRight: { marginLeft: 'auto', display: 'flex', gap: 8, flexShrink: 0 },
-    stepMeta: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' },
-    stepNote: { maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  // 诊断占位
-  diagnosePanel: {
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-    minHeight: 240,
-    padding: 24,
-    borderRadius: 10,
-    background: 'var(--dsw-alias-bg-layer-1)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    boxShadow: 'var(--dsw-shadow-lv1)',
-    textAlign: 'center',
-  },
-  diagnoseTitle: { fontSize: 15, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
-  diagnoseEmpty: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', maxWidth: 420 },
-  diagFolderBar: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 },
-  diagFolderLabel: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', fontWeight: 500, marginRight: 2 },
-  diagChip: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 4,
-    padding: '3px 8px',
-    borderRadius: 6,
-    fontSize: 12,
-    cursor: 'pointer',
-    background: 'var(--dsw-alias-bg-layer-2)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    color: 'var(--dsw-alias-label-secondary)',
-  },
-  // 代码规范治理面板
-  diagHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
-  diagHeadText: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
-  diagHint: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', maxWidth: 560 },
-  diagRunBtn: {
-    padding: '6px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer',
-    borderRadius: 6, whiteSpace: 'nowrap',
-    color: '#fff',
-    background: 'linear-gradient(135deg, #3b82f6, #8b5cf6)',
-    border: 'none',
-  },
-  diagSummaryBar: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', fontSize: 12 },
-  diagSummaryText: { color: 'var(--dsw-alias-label-primary)', fontWeight: 600 },
-  diagSummaryEll: { display: 'flex', gap: 12 },
-  diagList: { display: 'flex', flexDirection: 'column', gap: 10, overflow: 'auto', flex: 1, minHeight: 0 },
-  diagCard: {
-    display: 'flex', flexDirection: 'column', gap: 8, padding: 12,
-    borderRadius: 8, background: 'var(--dsw-alias-bg-layer-1)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-  },
-  diagCardHead: { display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' },
-  diagCardName: { fontSize: 13, fontWeight: 700, color: 'var(--dsw-alias-label-primary)', fontFamily: 'monospace' },
-  diagCardBadge: { fontSize: 11, fontWeight: 600 },
-  diagCardMeta: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginLeft: 'auto' },
-  diagRuleList: { display: 'flex', flexDirection: 'column', gap: 6 },
-  diagRuleRow: { display: 'flex', gap: 8, alignItems: 'flex-start' },
-  diagRuleMark: { fontSize: 13, fontWeight: 700, lineHeight: '18px', width: 14, flexShrink: 0 },
-  diagRuleTitle: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
-  diagRuleDetail: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', marginTop: 2 },
-  diagEvid: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', background: 'var(--dsw-alias-bg-layer-2)', padding: '3px 6px', borderRadius: 4, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
-  kernelBanner: {
-    display: 'flex',
-    alignItems: 'center',
-    flexWrap: 'nowrap',
-    whiteSpace: 'nowrap',
-    gap: 16,
-    padding: '8px 14px',
-    borderRadius: 10,
-    background: 'var(--dsw-alias-bg-layer-1)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    boxShadow: 'var(--dsw-shadow-lv1)',
-  },
-  kernelCol: { display: 'flex', flexDirection: 'row', alignItems: 'baseline', gap: 6, minWidth: 0 },
-  kernelDot: { color: 'var(--dsw-alias-label-tertiary)', fontSize: 13 },
-  kernelTitle: { color: 'var(--dsw-alias-label-secondary)', fontSize: 12, fontWeight: 500, whiteSpace: 'nowrap' },
-  kernelVersion: { fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', whiteSpace: 'nowrap' },
-  kernelChannel: {
-    fontSize: 12,
-    fontWeight: 500,
-    color: 'var(--dsw-alias-label-primary)',
-    fontFamily: 'var(--ds-font-family-code)',
-    whiteSpace: 'nowrap',
-  },
-  body: { display: 'flex', gap: 14, minHeight: 0, flex: 1, alignItems: 'flex-start' },
-  sidebar: {
-    width: 196,
-    flexShrink: 0,
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 4,
-    padding: 8,
-    borderRadius: 10,
-    background: 'var(--dsw-alias-bg-layer-1)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    boxShadow: 'var(--dsw-shadow-lv1)',
-    // 文件夹栏跟随顶部固定：右侧插件区滚动时文件夹保持可见，便于继续把插件拖入文件夹。
-    position: 'sticky',
-    top: 0,
-    maxHeight: 'min(52vh, 420px)',
-    overflowY: 'auto',
-    alignSelf: 'flex-start',
-  },
-  sidebarTitle: {
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    color: 'var(--dsw-alias-label-secondary)',
-    fontSize: 13, fontWeight: 500,
-    padding: '4px 6px 6px',
-  },
-  iconBtn: {
-    border: 'none',
-    background: 'transparent',
-    color: 'var(--dsw-alias-label-tertiary)',
-    fontSize: 13, fontWeight: 500,
-    cursor: 'pointer',
-    width: 26,
-    height: 26,
-    borderRadius: 6,
-  },
-  iconBtnSm: {
-    border: 'none',
-    background: 'transparent',
-    color: 'var(--dsw-alias-label-tertiary)',
-    cursor: 'pointer',
-    padding: '0 3px',
-    fontSize: 12,
-  },
-  createBox: { display: 'flex', gap: 6, margin: '0 2px 4px' },
-  input: {
-    flex: 1,
-    minWidth: 0,
-    fontSize: 12,
-    color: 'var(--dsw-alias-label-primary)',
-    background: 'transparent',
-    border: '1px solid var(--dsw-alias-border-l2)',
-    borderRadius: 6,
-    padding: '5px 8px',
-    outline: 'none',
-  },
-  primaryBtn: {
-    border: 'none',
-    background: 'var(--dsw-alias-state-business-primary)',
-    color: '#fff',
-    borderRadius: 6,
-    height: 28,
-    boxSizing: 'border-box',
-    padding: '0 14px',
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    cursor: 'pointer',
-    fontSize: 12, fontWeight: 500,
-    flexShrink: 0,
-  },
-  folder: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    padding: '7px 9px',
-    borderRadius: 7,
-    cursor: 'pointer',
-    color: 'var(--dsw-alias-label-primary)',
-    fontSize: 12, fontWeight: 500,
-    transition: 'background 0.15s ease',
-  },
-  folderActive: {
-    background: 'color-mix(in srgb, var(--dsw-alias-state-business-primary) 13%, transparent)',
-    color: 'var(--dsw-alias-state-business-primary)',
-  },
-  folderName: { flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  folderActions: { display: 'flex', gap: 2 },
-  folderCount: {
-    fontSize: 12,
-    color: 'var(--dsw-alias-label-secondary)',
-    background: 'var(--dsw-alias-bg-module-platform)',
-    borderRadius: 999,
-    padding: '0 7px',
-    flexShrink: 0,
-  },
-  cards: { flex: 1, display: 'flex', flexDirection: 'column', gap: 10, minWidth: 0, minHeight: 0 },
-  cardsHeader: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    padding: '6px 2px',
-    position: 'sticky',
-    top: 0,
-    zIndex: 5,
-    background: 'color-mix(in srgb, var(--dsw-alias-bg-layer-1) 92%, transparent)',
-    backdropFilter: 'blur(4px)',
-    borderBottom: '1px solid var(--dsw-alias-border-l1)',
-  },
-  cardsTitle: { fontSize: 15, fontWeight: 600, color: 'var(--dsw-alias-label-primary)', margin: 0 },
-  cardsCount: { color: 'var(--dsw-alias-label-tertiary)', fontSize: 12 },
-  // 改造2：拖拽悬停落点高亮（文件夹行）。
-  folderOver: {
-    outline: '2px solid var(--dsw-alias-state-business-primary)',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-business-primary) 18%, transparent)',
-  },
-  // 改造3：插件搜索框（放行首宽自适应）。
-  searchBox: {
-    marginLeft: 'auto',
-    width: 200,
-    fontSize: 12,
-    color: 'var(--dsw-alias-label-primary)',
-    background: 'var(--dsw-alias-bg-layer-2)',
-    border: '1px solid var(--dsw-alias-border-l2)',
-    borderRadius: 6,
-    padding: '4px 8px',
-    outline: 'none',
-  },
-  tempBar: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 8,
-    padding: '6px 10px',
-    borderRadius: 9,
-    background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 8%, transparent)',
-    border: '1px dashed var(--dsw-alias-border-l2)',
-  },
-  tempHint: { color: 'var(--dsw-alias-label-tertiary)', fontSize: 11, marginLeft: 'auto', whiteSpace: 'nowrap' },
-  tempRow: { display: 'flex', alignItems: 'center', gap: 8, width: '100%' },
-  dirCrumbs: {
-    display: 'flex',
-    alignItems: 'center',
-    flexWrap: 'wrap',
-    gap: 4,
-    fontSize: 12,
-    color: 'var(--dsw-alias-label-secondary)',
-  },
-  dirCrumb: {
-    cursor: 'pointer',
-    padding: '1px 3px',
-    borderRadius: 4,
-    color: 'var(--dsw-alias-state-business-primary)',
-  },
-  dirList: { display: 'flex', flexDirection: 'column', gap: 2, maxHeight: 180, overflowY: 'auto' },
-  dirRow: {
-    display: 'flex',
-    alignItems: 'center',
-    padding: '3px 6px',
-    borderRadius: 5,
-    cursor: 'pointer',
-    fontSize: 13,
-    border: '1px solid transparent',
-  },
-  dirName: { wordBreak: 'break-all' },
-  ghostBtn: {
-    border: '1px solid var(--dsw-alias-border-l2)',
-    background: 'transparent',
-    color: 'var(--dsw-alias-label-secondary)',
-    borderRadius: 6,
-    height: 28,
-    boxSizing: 'border-box',
-    padding: '0 12px',
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    cursor: 'pointer',
-    fontSize: 12,
-    flexShrink: 0,
-  },
-  reloadClientBtn: {
-    border: '1px solid var(--dsw-alias-border-l2)',
-    background: 'var(--dsw-alias-bg-muted)',
-    color: 'var(--dsw-alias-label-primary)',
-    borderRadius: 6,
-    height: 28,
-    boxSizing: 'border-box',
-    padding: '0 12px',
-    display: 'inline-flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    cursor: 'pointer',
-    fontSize: 12,
-    flexShrink: 0,
-  },
-  preflightSwitch: {
-    display: 'inline-flex',
-    alignItems: 'center',
-    gap: 7,
-    height: 32,
-    boxSizing: 'border-box',
-    padding: '0 9px',
-    borderRadius: 8,
-    border: '1px solid var(--dsw-alias-border-l2)',
-    background: 'var(--dsw-alias-bg-muted)',
-    cursor: 'pointer',
-    flexShrink: 0,
-    userSelect: 'none',
-  },
-  preflightSwitchTrackOn: {
-    position: 'relative',
-    width: 26,
-    height: 14,
-    borderRadius: 7,
-    boxSizing: 'border-box',
-    flexShrink: 0,
-    transition: 'background .15s ease',
-    background: 'var(--dsw-alias-state-success-primary)',
-  },
-  preflightSwitchTrackOff: {
-    position: 'relative',
-    width: 26,
-    height: 14,
-    borderRadius: 7,
-    boxSizing: 'border-box',
-    flexShrink: 0,
-    transition: 'background .15s ease',
-    background: 'var(--dsw-alias-border-l2)',
-  },
-  preflightSwitchKnobOn: {
-    position: 'absolute',
-    top: 1,
-    left: 13,
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    background: '#fff',
-    boxShadow: '0 1px 2px rgba(0,0,0,.25)',
-    transition: 'left .15s ease',
-  },
-  preflightSwitchKnobOff: {
-    position: 'absolute',
-    top: 1,
-    left: 1,
-    width: 12,
-    height: 12,
-    borderRadius: 6,
-    background: '#fff',
-    boxShadow: '0 1px 2px rgba(0,0,0,.25)',
-    transition: 'left .15s ease',
-  },
-  preflightSwitchLabel: {
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'flex-start',
-    lineHeight: 1.1,
-    color: 'var(--dsw-alias-label-primary)',
-    fontSize: 12,
-    whiteSpace: 'nowrap',
-  },
-  preflightSwitchSub: {
-    fontSize: 10,
-    color: 'var(--dsw-alias-label-secondary)',
-    whiteSpace: 'nowrap',
-  },
-  headRight: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
-  noteChip: {
-    ...pillBase,
-    fontFamily: 'var(--ds-font-family-code)',
-    color: 'var(--dsw-alias-state-warning-primary)',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 14%, transparent)',
-    border: '1px dashed var(--dsw-alias-state-warning-primary)',
-  },
-  statusBox: {
-    ...pillBase,
-    fontFamily: 'var(--ds-font-family-code)',
-    gap: 6,
-    background: 'var(--dsw-alias-bg-module-platform)',
-    border: '1px solid transparent',
-  },
-  statusBoxClick: {
-    ...pillBase,
-    fontFamily: 'var(--ds-font-family-code)',
-    gap: 6,
-    background: 'var(--dsw-alias-bg-module-platform)',
-    border: '1px solid var(--dsw-alias-border-l2)',
-    cursor: 'pointer',
-    transition: 'border-color 0.12s ease, box-shadow 0.12s ease',
-  },
-  statusBoxOrphan: {
-    borderColor: 'var(--dsw-alias-state-danger-primary)',
-  },
-  statusDot: { width: 8, height: 8, borderRadius: 999, flexShrink: 0, display: 'inline-block' },
-  statusTextNeutral: { color: 'var(--dsw-alias-label-secondary)' },
-  statusSrc: { opacity: 0.6, whiteSpace: 'nowrap' },
-  statusSrcOrphan: { color: 'var(--dsw-alias-state-danger-primary)', opacity: 1 },
-  tempRemoveBtn: {
-    ...pillBase,
-    color: 'var(--dsw-alias-state-danger-primary)',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-danger-primary) 8%, transparent)',
-    border: '1px solid color-mix(in srgb, var(--dsw-alias-state-danger-primary) 40%, transparent)',
-    cursor: 'pointer',
-  },
-  promoteBtn: {
-    ...pillBase,
-    border: '1px solid var(--dsw-alias-state-warning-primary)',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 14%, transparent)',
-    color: 'var(--dsw-alias-state-warning-primary)',
-    cursor: 'pointer',
-  },
-  flash: {
-    padding: '8px 12px',
-    borderRadius: 7,
-    background: 'color-mix(in srgb, var(--dsw-alias-state-success-primary) 14%, transparent)',
-    color: 'var(--dsw-alias-state-success-primary)',
-    fontSize: 12,
-  },
-  empty: { padding: 32, textAlign: 'center', color: 'var(--dsw-alias-label-tertiary)', fontSize: 13, },
-  grid: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(auto-fill, minmax(236px, 1fr))',
-    gap: 12,
-    minHeight: 0,
-  },
-  card: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 7,
-    padding: 12,
-    borderRadius: 10,
-    background: 'var(--dsw-alias-bg-layer-1)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    boxShadow: 'var(--dsw-shadow-lv1)',
-    cursor: 'grab',
-    position: 'relative',
-  },
-  // 拖拽排序插入指示条：悬停时在目标卡片左/右边缘显示 2px 竖线（改造：放宽精确落点）。
-  dropLine: {
-    position: 'absolute',
-    top: 4,
-    bottom: 4,
-    width: 2,
-    zIndex: 3,
-    borderRadius: 2,
-    background: 'var(--dsw-alias-state-business-primary)',
-  },
-  // 改造2：拖拽悬停落点高亮（插件卡片）。
-  cardOver: {
-    outline: '2px solid var(--dsw-alias-state-business-primary)',
-    boxShadow: 'var(--dsw-shadow-lv2)',
-  },
-  cardHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
-  badge: {
-    ...pillBase,
-    fontFamily: 'var(--ds-font-family-code)',
-    color: 'var(--dsw-alias-state-business-primary)',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-business-primary) 12%, transparent)',
-  },
-  badgeThird: {
-    ...pillBase,
-    fontFamily: 'var(--ds-font-family-code)',
-    color: 'var(--dsw-alias-label-secondary)',
-    background: 'var(--dsw-alias-bg-module-platform)',
-  },
-  badgeShell: {
-    ...pillBase,
-    fontFamily: 'var(--ds-font-family-code)',
-    color: 'var(--dsw-alias-tertiary-color, var(--dsw-alias-state-warning-primary))',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-warning-primary) 12%, transparent)',
-  },
-  cardTitleRow: { display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 },
-  cardName: {
-    flex: 1,
-    minWidth: 0,
-    fontSize: 13, fontWeight: 500,
-    color: 'var(--dsw-alias-label-primary)',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    whiteSpace: 'nowrap',
-    lineHeight: '20px',
-  },
-  cardVersion: {
-    font: 'var(--ds-font-family-code)',
-    fontSize: 11,
-    color: 'var(--dsw-alias-label-tertiary)',
-  },
-  cardMeta: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 6,
-    marginTop: 2,
-    paddingTop: 8,
-    borderTop: '1px solid var(--dsw-alias-border-l2)',
-  },
-  depsCount: {
-    flexShrink: 0,
-    fontSize: 11,
-    fontWeight: 600,
-    whiteSpace: 'nowrap',
-    cursor: 'pointer',
-    fontFamily: 'var(--ds-font-family-code)',
-    userSelect: 'none',
-  },
-  depsBox: {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 5,
-    padding: '8px 10px',
-    borderRadius: 7,
-    background: 'var(--dsw-alias-bg-module-platform)',
-    border: '1px solid var(--dsw-alias-border-l2)',
-  },
-  depsTitle: { fontSize: 11, fontWeight: 600, color: 'var(--dsw-alias-label-secondary)' },
-  depsEmpty: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', lineHeight: '15px' },
-  depsList: { display: 'flex', flexDirection: 'column', gap: 3, maxHeight: 300, overflowY: 'auto' },
-  depsItem: {
-    fontSize: 11,
-    color: 'var(--dsw-alias-label-secondary)',
-    fontFamily: 'var(--ds-font-family-code)',
-    whiteSpace: 'normal',
-    wordBreak: 'break-all',
-    lineHeight: '15px',
-  },
-  uninstallBtn: {
-    ...pillBase,
-    border: '1px solid color-mix(in srgb, var(--dsw-alias-state-danger-primary) 45%, transparent)',
-    background: 'color-mix(in srgb, var(--dsw-alias-state-danger-primary) 14%, transparent)',
-    color: 'var(--dsw-alias-state-danger-primary)',
-    cursor: 'pointer',
-  },
-  cardDesc: {
-    fontSize: 12,
-    color: 'var(--dsw-alias-label-secondary)',
-    minHeight: 34,
-    display: '-webkit-box',
-    WebkitLineClamp: 2,
-    WebkitBoxOrient: 'vertical',
-    overflow: 'hidden',
-    lineHeight: '17px',
-  },
-  cardDescMuted: {
-    fontSize: 12,
-    color: 'var(--dsw-alias-label-tertiary)',
-    minHeight: 34,
-    lineHeight: '17px',
-  },
-  noteBox: { marginTop: 'auto', paddingTop: 7, borderTop: '1px solid var(--dsw-alias-border-l2)' },
-  noteText: {
-    width: '100%',
-    textAlign: 'left',
-    border: 'none',
-    background: 'transparent',
-    color: 'var(--dsw-alias-label-secondary)',
-    fontSize: 12,
-    cursor: 'text',
-    padding: 0,
-    whiteSpace: 'pre-wrap',
-    wordBreak: 'break-word',
-  },
-  noteTextarea: {
-    width: '100%',
-    resize: 'none',
-    fontSize: 12,
-    color: 'var(--dsw-alias-label-primary)',
-    background: 'transparent',
-    border: '1px solid var(--dsw-alias-border-l2)',
-    borderRadius: 6,
-    padding: '6px 8px',
-    outline: 'none',
-  },
-  switchLabel: { display: 'inline-flex', alignItems: 'center', cursor: 'pointer' },
-  checkboxHidden: { opacity: 0, position: 'absolute', width: 0, height: 0, margin: 0, pointerEvents: 'none' },
-  switch: {
-    width: 40,
-    height: 20,
-    borderRadius: 999,
-    position: 'relative',
-    display: 'inline-block',
-    background: 'var(--dsw-alias-bg-layer-3)',
-    boxShadow: 'inset 0 0 0 1px var(--dsw-alias-border-l1)',
-    transition: 'background 0.2s ease',
-  },
-  knob: {
-    position: 'absolute',
-    top: 2,
-    left: 2,
-    width: 16,
-    height: 16,
-    borderRadius: 999,
-    background: '#fff',
-    boxShadow: 'var(--dsw-shadow-lv1)',
-    transition: 'transform 0.2s ease',
-  },
-  // 改造1：目录选择独立弹窗。
-  modalMask: {
-    position: 'fixed',
-    inset: 0,
-    zIndex: 1000,
-    background: 'rgba(0,0,0,.4)',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  modalPanel: {
-    width: 520,
-    maxWidth: '92vw',
-    maxHeight: '80vh',
-    overflowY: 'auto',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 10,
-    padding: 16,
-    borderRadius: 12,
-    background: 'var(--dsw-alias-bg-layer-2)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    boxShadow: 'var(--dsw-shadow-lv2)',
-  },
-  modalHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between' },
-  modalTitle: { fontSize: 14, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
-  modalBody: { fontSize: 13, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.6, whiteSpace: 'pre-wrap' },
-  modalFooter: { display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 8 },
-  checkboxRow: { display: 'flex', alignItems: 'center', gap: 8, marginTop: 8 },
-  checkbox: { width: 14, height: 14, accentColor: 'var(--dsw-color-primary)', flexShrink: 0 },
-  checkboxLabel: { fontSize: 13, color: 'var(--dsw-alias-label-secondary)', lineHeight: 1.4 },
-  dangerBtn: { background: 'var(--dsw-alias-state-danger-primary, #e74c3c)' },
-}

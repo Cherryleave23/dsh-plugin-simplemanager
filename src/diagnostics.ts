@@ -113,7 +113,23 @@ function snippetOf(src: string, line: number, max = 96): string {
 /** 行级匹配，返回命中（含来自 boot 过滤的扫描文件维度）。 */
 function findIn(src: string, re: RegExp): Line[] {
   const rex = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g')
-  return lines(src).filter((l) => rex.test(l.text))
+  // 注释行不计证据：注释文本里的 register/create 字样不是真实调用（自扫/含说明性注释的插件常见误报源）。
+  return lines(src).filter((l) => rex.test(l.text) && !/^\s*(\/\/|\*|\/\*)/.test(l.text))
+}
+
+/** 剔除 `/* diag:skip *\/` … `/* /diag:skip *\/` 标记区段（含标记行）。
+ * 预检引擎自身的驱动/mock 模板串会被编进 lib 产物，扫描器无法区分「引擎内嵌代码」与「插件真实代码」，
+ * 标记区段 = 明示「这是检测 harness 自身，非被检对象资源操作」。 */
+function stripDiagSkip(src: string): string {
+  const L = lines(src)
+  const out: string[] = []
+  let skipping = false
+  for (const l of L) {
+    if (/\/\*\s*diag:skip\s*\*\//.test(l.text)) { skipping = true; continue }
+    if (/\/\*\s*\/diag:skip\s*\*\//.test(l.text)) { skipping = false; continue }
+    if (!skipping) out.push(l.text)
+  }
+  return out.join('\n')
 }
 
 function lineOf(src: string, partial: string): number {
@@ -156,7 +172,9 @@ function effectCoveredLines(src: string): Set<number> {
  */
 function rule1(sourceName: string, src: string): RuleVerdict {
   const title = 'webServer 路由注册须用 ctx.effect 包裹（宿主随 entry 拆除释放）'
-  const regs = findIn(src, /\.register\(\s*\{|webServer\.register\(/)
+  // 只认 webServer 路由注册：`webServer.register(` 或路由形状 register({ kind: 'exact'|'prefix' …。
+  // 宽正则 `\.register\(\{` 会误抓 slots.register（官方 client 挂载链 effect→inject→register 的一环）。
+  const regs = findIn(src, /webServer\s*\.\s*register\s*\(|\.register\s*\(\s*\{\s*kind\s*:\s*['"]/)
   if (regs.length === 0) {
     return { ruleId: 1, title, level: 'ok', detail: '未发现 webServer.register 路由注册，无路由泄漏风险。', evidence: [], suggest: '' }
   }
@@ -225,32 +243,42 @@ function rule2(sourceName: string, src: string): RuleVerdict {
 
 function rule3(sourceName: string, src: string): RuleVerdict {
   const title = '生命周期严格对称（apply 创建 vs 清理回收）'
-  const createCount = (() => {
-    let n = 0
-    for (const re of [/\.create\s*\(/, /\.register\s*\(/, /\.addListener\s*\(/, /\.on\s*\(/, /\.use\s*\(/]) n += findIn(src, re).length
-    return n
-  })()
-  const cleanBlock = extractReturnCleanup(src)
-  if (!cleanBlock) {
-    return { ruleId: 3, title, level: 'ok', detail: '未探测到 apply 级创建/清理可对比（无 deactivate 清理体，视作无挂载资源）。', evidence: [], suggest: '' }
+  // 只统计「需显式回收的持久资源」创建点：register/create。
+  // 排除官方 slot 挂载链（slots.register/slots.inject）：client UI 挂载由官方 runtime 随卸载整组回收，
+  // 不属于需插件自行成对回收的持久资源（否则官方挂载写法必误报）。
+  const createPts: Line[] = findIn(src, /\.register\s*\(|\.create\s*\(/)
+    .filter((p) => !/slots\s*\.\s*(register|inject)\s*\(/.test(p.text))
+  if (createPts.length === 0) {
+    return { ruleId: 3, title, level: 'ok', detail: '未发现 register/create 持久资源创建点，无生命周期对称问题。', evidence: [], suggest: '' }
   }
+  // 资源创建全部落在 ctx.effect 内 → 由宿主 effect 拆除统一回收，天然对称，无需 deactivate 清理体。
+  const covered = effectCoveredLines(src)
+  const uncovered = createPts.filter((p) => !covered.has(p.n))
+  if (uncovered.length === 0) {
+    return {
+      ruleId: 3, title, level: 'ok',
+      detail: `发现 ${createPts.length} 处 register/create 均在 ctx.effect 内：宿主在 entry 拆除时走 effect 回收，生命周期对称、无残留（函数式插件惯用法）。`,
+      evidence: [], suggest: '',
+    }
+  }
+  // 回收证据看全文件（dispose/remove/unregister/…），不限 return 清理体：
+  // loader.create→(使用)→loader.remove 这类跨方法对称流同样成立，只认 return 体会把官方装配流误判泄漏。
   const cleanCount = (() => {
     let n = 0
-    for (const re of [/\.dispose\s*\(/, /\.off\s*\(/, /\.remove\s*\(/, /\.unregister\s*\(/, /\.clear\s*\(/, /\.end\s*\(/, /\.close\s*\(/]) n += findIn(cleanBlock, re).length
+    for (const re of [/\.dispose\s*\(/, /\.off\s*\(/, /\.remove\s*\(/, /\.unregister\s*\(/, /\.clear\s*\(/, /\.end\s*\(/, /\.close\s*\(/]) n += findIn(src, re).length
     return n
   })()
-  // 创建明显多于清理（>8 对 0 视为严重失衡）时给疑点，避免正常 hook 注册误报。
-  if (createCount > 0 && cleanCount === 0) {
+  if (cleanCount === 0) {
     return {
       ruleId: 3, title, level: 'warn',
-      detail: `apply 内探测到约 ${createCount} 处创建/注册/监听，但 deactivate 清理体内回收调用为 0，生命周期疑似不对称。`,
-      evidence: [],
-      suggest: '对照 apply 的每处 create/register/on，在清理体内成对回收，保证停因进程无残留。',
+      detail: `发现 ${uncovered.length} 处 register/create 落在 ctx.effect 外，且全文件未见任何回收原语（dispose/remove/unregister…），疑似资源随拆泄漏。`,
+      evidence: uncovered.map((r) => ({ file: sourceName, line: r.n, snippet: snippetOf(src, r.n) })),
+      suggest: '将资源注册移入 ctx.effect（宿主托管拆除），或在 deactivate 清理体内成对 dispose/unregister/off。',
     }
   }
   return {
     ruleId: 3, title, level: 'ok',
-    detail: `apply 创建约 ${createCount} 处 / 清理回收约 ${cleanCount} 处，比例正常。`,
+    detail: `apply 内 ${uncovered.length} 处 effect 外资源创建，全文件回收原语约 ${cleanCount} 处，生命周期对称。`,
     evidence: [], suggest: '',
   }
 }
@@ -316,11 +344,23 @@ function rule5(sourceName: string, src: string): RuleVerdict {
 
 function rule6(sourceName: string, src: string): RuleVerdict {
   const title = '不吞错、不假装清理'
+  const all = lines(src)
   const emptyCatches = findIn(src, /catch\s*(?:\(\s*\w+\s*\))?\s*\{\s*\}/)
-  const ignoreCatches = findIn(src, /catch\s*\([^)]*\)\s*\{\s*\/\*[^]*\/\s*\}/)
-  // 疑似「假装清理」：'已卸载/已释放'文案但清理体空
-  const pretendMsg = /已卸载|已释放|已回收|unloaded|disposed/.test(src)
-  const fakeClean = extractReturnCleanup(src) && /已卸载|已释放|已回收/.test(src) ? findIn(src, /已卸载|已释放|已回收/) : []
+    // 非致命能力探测/偏好读写的空 catch 属可接受降级（探测失败走 fallback 或用默认值）：
+    // localStorage/sessionStorage 偏好、navigator.clipboard 探测等。看 catch 前后 8 行窗口内的探测信号；
+    // 且经打包器剥注释后「catch { /* ignore */ }」呈现为空 catch，须按内容豁免而非按注释。
+    .filter((c) => {
+      const from = Math.max(0, c.n - 9)
+      const around = all.slice(from, c.n).map((l) => l.text).join('\n')
+      return !/localStorage|sessionStorage|navigator\.clipboard/.test(around)
+    })
+  const ignoreCatches = findIn(src, /catch\s*\([^)]*\)\s*\{\s*\/\*[\s\S]*?\*\/\s*\}/)
+  // 疑似「假装清理」：return 清理体内出现「已卸载/已释放/已回收」文案、却不含任何真实回收调用。
+  // 文案出现在别处（如步骤日志的成功消息）不算——只有清理体自身「说释放了却没动真格」才 flag。
+  const cleanBlock = extractReturnCleanup(src)
+  const fakeClean = cleanBlock && /已卸载|已释放|已回收/.test(cleanBlock) && !/\.(?:dispose|off|remove|unregister|clear|end|close)\s*\(/.test(cleanBlock)
+    ? findIn(cleanBlock, /已卸载|已释放|已回收/)
+    : []
   if (emptyCatches.length > 0 || ignoreCatches.length > 0) {
     return {
       ruleId: 6, title, level: 'warn',
@@ -450,7 +490,7 @@ export function diagnosePlugin(packageName: string, profileDir: string, runtimeP
   let whole = ''
   const sourceName = 'lib/*.js'
   for (const f of targets) {
-    try { whole += '\n' + readFileSync(f, 'utf8') } catch { /* 跳过不可读 */ }
+    try { whole += '\n' + stripDiagSkip(readFileSync(f, 'utf8')) } catch { /* 跳过不可读 */ }
     scanned += 1
   }
   if (scanned > 0) {

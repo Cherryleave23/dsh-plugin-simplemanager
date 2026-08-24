@@ -60,6 +60,11 @@ export class SimpleManagerHost {
   private overlayCache: { raw: string; data: Overlay } | null = null
   private configFile: string
   private configCache: { raw: string; data: SimpleManagerConfig } | null = null
+  /** catalog 扫描缓存：scanCatalog 是全盘目录走查 + 逐包 JSON.parse（阻塞事件循环），
+   * 而 buildCatalog 在 9 个路由点被每次请求调用——不缓存则每个 HTTP 请求都全盘重扫。
+   * TTL 兜底外部变更（终端手工 pnpm），变更路径（装卸/转正）显式 invalidateCatalog。 */
+  private catalogCache: { at: number; data: PluginBundle[] } | null = null
+  private static readonly CATALOG_TTL_MS = 4000
 
   constructor(profileDir: string, dataDir: string = DEFAULT_DATA_DIR) {
     this.profileDir = profileDir
@@ -189,7 +194,15 @@ export class SimpleManagerHost {
   }
 
   // ---- 插件目录扫描（不含 live enabled；enabled 由 index 层合并 loader） ----
+  /** 节点变更后强制下次全盘重扫（装卸/转正/卸载等改变 node_modules 的路径调用）。 */
+  invalidateCatalog(): void {
+    this.catalogCache = null
+  }
+
   scanCatalog(): PluginBundle[] {
+    if (this.catalogCache && Date.now() - this.catalogCache.at < SimpleManagerHost.CATALOG_TTL_MS) {
+      return this.catalogCache.data
+    }
     const out: PluginBundle[] = []
     const seen = new Set<string>()
     const overrides = this.readConfig().scopeOverrides
@@ -237,13 +250,21 @@ export class SimpleManagerHost {
       }
     }
 
+    this.catalogCache = { at: Date.now(), data: out }
     return out
   }
 
   // ---- 作用域分类 + 元数据解析（供装配驱动的 catalog 按名反查） ----
-  /** 按包名分类作用域（主数据源是装配表；本方法对装配表里目录扫描漏掉的包也能正确归类）。 */
-  scopeOf(name: string): PluginScope {
-    return resolveScope(name, this.readConfig().scopeOverrides)
+  /** 按包名分类作用域（主数据源是装配表；本方法对装配表里目录扫描漏掉的包也能正确归类）。
+   * located：包的物理位置。'runtime'（宿主 resources）→ 壳内包，无视名字启发式一律 shell，
+   * 防止无 @deepseek-ai/ 前缀的壳自带包（如 dshmarket）被判 third→孤儿；scopeOverrides 优先级最高。 */
+  scopeOf(name: string, located?: PluginBundle['source']): PluginScope {
+    const overrides = this.readConfig().scopeOverrides
+    if (overrides[name]) return overrides[name]
+    // 官方前缀包按既有名单识别（official/shell），不受物理位置影响——防止壳内 @deepseek-ai/* 被位置规则改判。
+    if (name.startsWith('@deepseek-ai/')) return resolveScope(name, overrides)
+    if (located === 'runtime') return 'shell'
+    return resolveScope(name, overrides)
   }
 
   /**
@@ -306,6 +327,8 @@ export class SimpleManagerHost {
     const next = editPatch(text, id, name, enabled)
     if (next === text) return false
     backup(this.patchFile)
+    // 直写理由（规则4豁免）：patch 启停是官方声明式契约（cordis.patch.yml），官方未提供运行时改写 API，
+    // 此处直写 + 写前 backup() 快照是唯一官方认可的持久化路径，非装配旁路。
     atomicWrite(this.patchFile, next)
     return true
   }
@@ -325,6 +348,8 @@ export class SimpleManagerHost {
     const bundles = manifest.dsh?.profile?.bundles
     if (!Array.isArray(bundles) || !bundles.includes(packageName)) return false
     manifest.dsh!.profile!.bundles = bundles.filter((b) => b !== packageName)
+    // 直写理由（规则4豁免）：dsh.profile.bundles 是官方 `dsh plugin add` 的装配登记处，
+    // 官方未提供「从登记表移除单包」的运行时 API（remove 是全量装卸）；卸载后同步清登记防幽灵装配，非旁路。
     atomicWrite(manifestPath, JSON.stringify(manifest, null, 2))
     return true
   }
