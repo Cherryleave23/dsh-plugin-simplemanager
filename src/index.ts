@@ -12,9 +12,10 @@
  *   - note / rename / scope ：插件备注 / 显示名 / 作用域覆盖
  */
 import { homedir } from 'node:os'
-import { basename, isAbsolute, join, normalize } from 'node:path'
-import { existsSync, readFileSync, rmSync, statSync } from 'node:fs'
+import { basename, dirname, isAbsolute, join, normalize } from 'node:path'
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import vm from 'node:vm'
 import { createRequire } from 'node:module'
 import type { Context } from '@deepseek-ai/cordis'
@@ -30,10 +31,12 @@ import { pnpmAdd, pnpmRemove, specPackageName, verifyInstalled } from './pnpm.js
 import { diagnosePlugin, resolveInstalledDir } from './diagnostics.js'
 import { realCordisGate } from './preflight.js'
 import { clientSmokeTest, detectClientArtifact, detectOfficialPeerDeps, locateClientRoots, smokeErrToString, type ClientSmokeReport } from './smoke.js'
+import { evictPackageModuleCaches } from './module-cache.js'
+import { registerAgentTools, type AgentOps, type OpResult, type OpStep, type PreflightDTO, type ReloadClientDTO, type StatusDTO } from './agent-tools.js'
 
 export const name = 'dsh-plugin-simplemanager'
 
-export const inject = ['webServer', 'loader']
+export const inject = ['webServer', 'loader', 'skills']
 
 /** DSH Desktop 宿主公开的 desktopProfiles 服务最小类型面（只读探测用）。 */
 interface DesktopProfiles {
@@ -50,6 +53,9 @@ interface LoaderService {
    * 根因在 error.cause 链），故此处仅用于成功后的运行态观测，不做失败判定。 */
   resolve?(id: string): { fiber?: { state?: number } | null }
   entries(): Iterable<{ id?: string; options?: { name?: string; group?: boolean }; disabled?: boolean; fiber?: { state?: number } | null }>
+  /** Node 内部模块加载器（官方 HMR 同款缓存驱逐钥匙；v1=Node 22/23、v2=Node 24+）。宿主经
+   * node-addon-require-builtin 暴露时可用；不可用时 tempLoad 的模块缓存驱逐静默降级为现状。 */
+  internal?: { version?: 'v1' | 'v2'; loadCache?: unknown }
 }
 
 /** 本插件消费的官方 service 最小类型面。inject 只声明全环境通用的核心服务（webServer / loader）；
@@ -149,11 +155,42 @@ export function apply(ctx: AppContext): void {
           }
           h.forgetHotInstall(pkg)
         }
+        // P-052 兜底：清空热装换键副本目录 .dsh-hot（该目录专放同名热装的临时副本，仅服务于当次热装，
+        // 重启后必不在装配；tempRemove 已删的部分这里再兜底一次，保证零残留且不碰源码目录）。
+        if (h.profileDir) {
+          const hotRoot = join(h.profileDir, '.dsh-hot')
+          try { rmSync(hotRoot, { recursive: true, force: true }) } catch { /* 兜底尽力而为 */ }
+        }
       } catch { /* 启动清理失败不影响宿主启动 */ }
     }
     void resign(ctx, host).then(() => {}, () => {})
   }
   setTimeout(cleanupHotResidue, 4000)
+
+  // —— 面向 agent 的闭环工具注册（v6）——
+  // DSH 进程内 agent 只能调用 ctx.tools.register 注入的工具。registerAgentTools 内部用 ctx.get('tools')
+  // 动态探测：仅在有 tools 服务的宿主注册，无 agent 场景静默跳过、不改加载行为。注册即 effect（返回 disposer）。
+  ctx.effect(() => {
+    const disposers = registerAgentTools(ctx, makeAgentOps(ctx, host))
+    // 随包内嵌「pm-manage」skill：agent 需要插件热装调试时按需读取，平时不加载详参（渐进披露）。
+    // 宿主 AppContext 类型未声明 skills，此处运行时收窄；无该服务的宿主优雅跳过，不改加载行为。
+    const skillService = (ctx as unknown as { skills?: { register(_s: unknown): () => void } }).skills
+    if (skillService?.register) {
+      const skillDir = dirname(fileURLToPath(import.meta.url))
+      let skillContent = ''
+      try { skillContent = readFileSync(join(skillDir, 'skill', 'main.md'), 'utf8') } catch { /* 缺文件则降级为空内容 */ }
+      disposers.push(skillService.register({
+        name: 'pm-manage',
+        description: '当需要临时热装/同名重装第三方插件取新代码进行调试、热卸、转正、卸载、热装前预检，或刷新界面让新的插件前端对用户可见时，读取本指南按正确顺序编排 pm_* 工具。',
+        whenToUse: '要动 pm_* 插件的生命周期（热装/热卸/转正/卸载/预检）或刷新前端时',
+        source: 'dsh-plugin-simplemanager',
+        content: skillContent,
+        resourceBase: { kind: 'directory', path: join(skillDir, 'skill') },
+        invocation: { modelInvocable: true, userInvocable: false },
+      }))
+    }
+    return () => { for (const d of disposers) d() }
+  })
 
   const buildView = (): BrowseView => {
     const overlay = host.readOverlay()
@@ -491,6 +528,95 @@ export function apply(ctx: AppContext): void {
             return send({ ok: true, report })
           }
 
+          // 工具管理「列出工具」（默认形态）：扫出全部可见工具，仅按手动拖拽归属 + 自定义工具组卡分组（不做源码归组）。
+          // 未手动归属的工具全部进 unassigned（默认「未分组/未知」大聚合卡）。解耦「扫出」与「归组」。
+          if (action === 'listTools') {
+            const v = buildToolView(ctx, host, { scan: false })
+            return send({ ok: true, toolCats: v.toolCats, cards: v.cards, unassigned: v.unassigned })
+          }
+
+          // 工具管理「扫描分组」（增强按钮）：在默认形态基础上，额外对已装第三方插件做源码注册扫描，
+          // 把可判定的工具自动归到对应插件卡（复用插件管理文件夹排布由前端叠加）。手动拖拽归属优先于扫描。
+          if (action === 'scanToolGroups') {
+            const v = buildToolView(ctx, host, { scan: true })
+            return send({ ok: true, toolCats: v.toolCats, cards: v.cards, unassigned: v.unassigned })
+          }
+
+          // 工具管理「自定义工具组卡」增删改（工具管理特有，不进入插件管理页）。
+          if (action === 'addToolCat' || action === 'renameToolCat' || action === 'removeToolCat') {
+            const body = await readJsonBody(req)
+            const ov = host.readOverlay()
+            const cats = { ...(ov.toolCats ?? {}) }
+            if (action === 'addToolCat') {
+              const name = (typeof body.name === 'string' ? body.name : '').trim()
+              if (!name) return fail('缺少工具组卡名称')
+              const id = `cat-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+              cats[id] = { name }
+              host.writeOverlay({ ...ov, toolCats: cats })
+              return send({ ok: true, id, name })
+            }
+            if (action === 'renameToolCat') {
+              const id = typeof body.id === 'string' ? body.id : ''
+              const name = (typeof body.name === 'string' ? body.name : '').trim()
+              if (!id || !cats[id]) return fail('工具组卡不存在')
+              if (!name) return fail('工具组卡名称不能为空')
+              cats[id] = { name }
+              host.writeOverlay({ ...ov, toolCats: cats })
+              return send({ ok: true, id, name })
+            }
+            // removeToolCat：删除卡片，并把曾归属到它的工具引用清空（回未分组）。
+            const id = typeof body.id === 'string' ? body.id : ''
+            if (!id || !cats[id]) return fail('工具组卡不存在')
+            delete cats[id]
+            const overrides = { ...(ov.toolGroupOverrides ?? {}) }
+            for (const [tool, key] of Object.entries(overrides)) {
+              if (key === id) delete overrides[tool]
+            }
+            host.writeOverlay({ ...ov, toolCats: cats, toolGroupOverrides: overrides })
+            return send({ ok: true })
+          }
+
+          if (action === 'setToolGroup') {
+            // 工具管理「拖拽改归属」：持久化 toolGroupOverrides（工具名 -> 归属卡片 key：
+            // 插件包名 / 自定义工具组卡 id / 空=回未分组）。
+            const body = await readJsonBody(req)
+            const tool = typeof body.tool === 'string' ? body.tool : ''
+            const owner = typeof body.owner === 'string' ? body.owner : ''
+            if (!tool) return fail('缺少工具名')
+            const ov = host.readOverlay()
+            const overrides = { ...(ov.toolGroupOverrides ?? {}) }
+            if (owner === '') delete overrides[tool]
+            else overrides[tool] = owner
+            host.writeOverlay({ ...ov, toolGroupOverrides: overrides })
+            return send({ ok: true, tool, owner: overrides[tool] ?? '' })
+          }
+
+          if (action === 'setToolEnabled') {
+            // 工具管理开关：单工具（name）或整插件（names 数组，卡牌级总开关全开/全关）。写 overlay toolDeny
+            // 持久化；并对每个 agent 的热工具视图调 tools.restrict({deny}) 真禁注入（能力可用时）。
+            const body = await readJsonBody(req)
+            const name = typeof body.name === 'string' ? body.name : ''
+            const enabled = body.enabled !== false
+            const names = Array.isArray(body.names) ? body.names.filter((x: unknown): x is string => typeof x === 'string') : []
+            const targets = names.length > 0 ? names : name ? [name] : []
+            const appliedNames = names.length > 0 ? null : name
+            if (targets.length === 0) return fail('缺少工具名')
+            const ov = host.readOverlay()
+            const deny = new Set(ov.toolDeny)
+            for (const t of targets) {
+              if (enabled) deny.delete(t)
+              else deny.add(t)
+            }
+            host.writeOverlay({ ...ov, toolDeny: [...deny] })
+            // 整插件开关：对所有目标应用同一 deny 方向（per-tool restrict 覆盖各自状态；批量按统一态设，单工具状态保留由前端以 names 各自传入）
+            let applied = false
+            for (const t of targets) {
+              const ok = applyToolRestrict(ctx, t, !enabled)
+              if (ok) applied = true
+            }
+            return send({ ok: true, name: appliedNames, names: names.length > 0 ? targets : undefined, enabled, deny: [...deny], applied })
+          }
+
           if (action === 'toggle') {
             const body = await readJsonBody(req)
             const id = typeof body.id === 'string' ? body.id : ''
@@ -715,6 +841,24 @@ export function apply(ctx: AppContext): void {
             }
           }
 
+          if (action === 'requestReload') {
+            // agent 触发「刷新渲染进程」：仅登记信号，不做任何检测（护栏由 agent 自行编排）。
+            const nonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+            pendingReload = { ts: Date.now(), nonce }
+            return send({ ok: true, nonce })
+          }
+
+          if (action === 'reloadSignal') {
+            // 前端轮询消费：有有效信号则读后清空并回报；过期陈旧信号一并清掉。
+            const p = pendingReload
+            if (p && Date.now() - p.ts <= RELOAD_SIGNAL_TTL) {
+              pendingReload = null
+              return send({ ok: true, pending: true, nonce: p.nonce })
+            }
+            if (p) pendingReload = null
+            return send({ ok: false, pending: false })
+          }
+
           if (action === 'promote') {
             const body = await readJsonBody(req)
             const id = typeof body.id === 'string' ? body.id : ''
@@ -914,12 +1058,262 @@ function buildCatalog(ctx: AppContext, host: SimpleManagerHost): PluginBundle[] 
 
 /** 临时闭包：resolve 名 → { entryId, spec（pnpm add 用原始 spec）, installedDeps（本次补装闭包依赖）}。
  * 临时插件随进程消亡、不写 patch，无需落盘；转正（promote）才写 patch 持久化。 */
-const tempInfos = new Map<string, { entryId: string; spec: string; installedDeps: string[] }>()
+const tempInfos = new Map<string, { entryId: string; spec: string; installedDeps: string[]; hotCopy?: string }>()
 /** 已转正待重启的插件（本次进程 entry 仍运行至退出；重启后由 patch 装配为持久）。会话级内存，重启即空。 */
 const promotedPending = new Set<string>()
 /** 本会话成功卸载、但装配/物理层可能仍在收敛（loader 未即时拆除 / 桌面壳复核写回）而仍残留在列表的包名。
  * 装配层收敛以重启为判定（P-039），此集用于 buildView 把这类残留正确标记为「已卸载、不可启停」，而非正常可装可启停插件。 */
 const recentlyUninstalled = new Set<string>()
+
+/** 本进程内已热装过（含已 tempRemove 掉）的包名集合：同名热装判定用，进程生命周期，不随 tempRemove 清除。
+ * 依据 P-052：宿主拿不到 Node 内部 loadCache（Electron no-realm）且模块地图按 specifier 键控、
+ * 进程内无公开失效手段——同名包本进程加载过后，重装同 specifier 必命中旧模块缓存。此集合驱动 tempLoad
+ * 的「自动换键」：二次同名热装时改写包 name 换全新 specifier 以取新码。 */
+const seenLocalNames = new Set<string>()
+/** 自动换键的单调序号：dsh-xx → dsh-xx-hot1 → dsh-xx-hot2 … */
+let hotSeq = 0
+/** 热装换键生成的临时副本登记：新包名 → 副本目录（profile/.dsh-hot/<新名>）。tempRemove/uninstall 与
+ * P-033 启动清扫据此回收副本，保证换键零残留、源码目录不被触碰。 */
+const hotCopyDirs = new Map<string, string>()
+
+// —— 工具管理（扫描分组 + 开关）——
+/** 工具管理单个工具元数据：name + 启用态 + 描述 + 参数 schema（JSON Schema 子集），UI 只读展示。 */
+interface ToolMeta {
+  name: string
+  enabled: boolean
+  description: string
+  parameters?: { type?: string; properties?: Record<string, unknown> }
+}
+// 枚举当前 tools 全局视图的全部可见工具名。tools.view() 缺省 scope=global 视图，第三方注册的所有工具都在。
+// 返回 name -> definition；definition 顶层含 name/description/parameters（JSON Schema 子集）等，详情直读无需扫源码。
+function listVisibleTools(ctx: Context): Map<string, Record<string, unknown>> {
+  const tools = (ctx as { get?(k: string): unknown }).get?.('tools') as
+    | { view?(scope?: unknown): { visible?: Map<string, unknown> } }
+    | undefined
+  if (!tools || typeof tools.view !== 'function') return new Map()
+  const visible = tools.view().visible
+  const out = new Map<string, Record<string, unknown>>()
+  if (!visible) return out
+  for (const [name, def] of visible) out.set(name, (def && typeof def === 'object' ? def : {}) as Record<string, unknown>)
+  return out
+}
+
+/** 从工具 definition 提取便于 UI 展示的描述与参数 schema（JSON Schema 子集）。definition 可能为空/异形，安全兜底。 */
+function describeTool(def: Record<string, unknown>): { description: string; parameters: Record<string, unknown> | undefined } {
+  const description = typeof def.description === 'string' ? def.description : ''
+  const parameters =
+    def.parameters && typeof def.parameters === 'object' ? (def.parameters as Record<string, unknown>) : undefined
+  return { description, parameters }
+}
+
+/** 工具管理统一视图构造（解耦「扫出工具」与「归组」）：
+ * - scan=false（默认 listTools）：只按用户手动拖拽的 toolGroupOverrides 归属 + 自定义工具组卡，不做源码扫描。
+ *   未（被手动）归属的工具全部进 unassigned（即默认的「未分组/未知」大聚合卡）。
+ * - scan=true（增强 scanToolGroups）：额外对已装第三方插件做源码注册扫描，把可判定的工具自动归到对应插件卡。
+ * 返回 toolCats + 卡片(cards: plugin/toolcat) + unassigned。归属 key 校验：仅当是已知插件或有同名自定义卡才有效，
+ * 否则该工具回未分组（避免悬空引用）。 */
+function buildToolView(
+  ctx: AppContext,
+  host: SimpleManagerHost,
+  opts: { scan: boolean },
+): {
+  toolCats: Array<{ id: string; name: string }>
+  cards: Array<{ kind: 'plugin' | 'toolcat'; key: string; tools: ToolMeta[] }>
+  unassigned: ToolMeta[]
+} {
+  const overlay = host.readOverlay()
+  const visibleTools = listVisibleTools(ctx)
+  const liveNames = new Set(visibleTools.keys())
+  const deny = new Set(overlay.toolDeny)
+  const cats = overlay.toolCats ?? {}
+  const overrides = overlay.toolGroupOverrides ?? {}
+  const catalog = buildCatalog(ctx, host)
+  const pluginNameSet = new Set(catalog.map((b) => b.name))
+  const metaOf = (n: string): ToolMeta => {
+    const d = describeTool(visibleTools.get(n) ?? {})
+    return { name: n, enabled: !deny.has(n), description: d.description, parameters: d.parameters }
+  }
+  // 1) 归属：先烙手动覆盖，再做源码归属（仅 scan=true 且未被手动固化时）。
+  const assigned = new Map<string, string>()
+  for (const [tool, key] of Object.entries(overrides)) {
+    if (!liveNames.has(tool)) continue
+    if (!key || !cats[key] && !pluginNameSet.has(key)) continue // 悬空引用丢弃 → 未分组
+    assigned.set(tool, key)
+  }
+  if (opts.scan) {
+    const profileDir = host.profileDir ?? ''
+    const third = catalog.filter((b) => b.scope === 'third')
+    for (const b of third) {
+      const pkgDir = profileDir ? join(profileDir, 'node_modules', b.name) : ''
+      if (!pkgDir) continue
+      let found: string[] = []
+      try { if (existsSync(pkgDir)) found = scanToolNamesInPackage(pkgDir) } catch { found = [] }
+      for (const n of found) {
+        if (liveNames.has(n) && !assigned.has(n)) assigned.set(n, b.name)
+      }
+    }
+  }
+  // 2) 组装卡片
+  const cardsMap = new Map<string, { kind: 'plugin' | 'toolcat'; key: string; tools: ToolMeta[] }>()
+  const unassigned: ToolMeta[] = []
+  for (const n of liveNames) {
+    const m = metaOf(n)
+    const key = assigned.get(n)
+    if (!key) { unassigned.push(m); continue }
+    const kind: 'plugin' | 'toolcat' = cats[key] ? 'toolcat' : 'plugin'
+    if (!cardsMap.has(key)) cardsMap.set(key, { kind, key, tools: [] })
+    cardsMap.get(key)!.tools.push(m)
+  }
+  // 自定义工具组卡常驻（即使暂时无工具，供拖拽落点）。
+  const toolCats = Object.entries(cats).map(([id, c]) => ({ id, name: c.name }))
+  for (const { id } of toolCats) {
+    if (!cardsMap.has(id)) cardsMap.set(id, { kind: 'toolcat', key: id, tools: [] })
+  }
+  const cards = [...cardsMap.values()]
+    .map((c) => ({ ...c, tools: c.tools.sort((a, b) => a.name.localeCompare(b.name)) }))
+    .sort((a, b) => (a.kind === b.kind ? a.key.localeCompare(b.key) : a.kind === 'plugin' ? -1 : 1))
+  unassigned.sort((a, b) => a.name.localeCompare(b.name))
+  return { toolCats, cards, unassigned }
+}
+
+/** 扫描单个已装插件产物目录，提取 tools.register / defineTool 的 name 字符串字面量作为该插件注册的工具名。
+ * 递归扫 packageRoot 下 {lib,client,src,dist,build,runtime}/**.js；只抓 `name: "…"` / `name:'…'` 字面量，
+ * 且位于 tools.register( 或 defineTool( 上下文内（粗粒度：同一作用块内出现 name 即视为工具声明）。
+ * 工厂封装（name: opts.name）等动态名抓不到——那是分组兜底的归属范围。 */
+function scanToolNamesInPackage(packageRoot: string, seen = new Set<string>(), fileCount = 0): string[] {
+  if (fileCount > 400) return [] // 防止失控递归扫海量文件
+  if (seen.has(packageRoot)) return []
+  seen.add(packageRoot)
+  const found = new Set<string>()
+  let dirEntries: string[] = []
+  try { dirEntries = readdirSync(packageRoot, 'utf8') } catch { return [] }
+  for (const entry of dirEntries) {
+    const full = join(packageRoot, entry)
+    if (['node_modules', '.git', '.dsh-hot'].includes(entry)) continue
+    let st: { isDirectory(): boolean; isFile(): boolean }
+    try { st = statSync(full) } catch { continue }
+    if (st.isDirectory()) {
+      fileCount += countFilesQuick(full)
+      for (const n of scanToolNamesInPackage(full, seen, fileCount)) found.add(n)
+      continue
+    }
+    if (!entry.endsWith('.js') && !entry.endsWith('.mjs') && !entry.endsWith('.cjs')) continue
+    let text = ''
+    try { text = readFileSync(full, 'utf8') } catch { continue }
+    const nameRe = /\b(name)\s*:\s*['"]([^'"]+)['"]/g
+    const callRe = /(?:tools\.register|defineTool)\s*\(/g
+    // 从每个 register/defineTool 调用处向后找最近的 name 字面量（粗粒度聚类）。
+    let m: RegExpExecArray | null
+    let lastRegEnd = -1
+    while ((m = nameRe.exec(text)) !== null) {
+      const name = m[2]
+      const idx = m.index
+      // 是否落在某个 register/defineTool 调用词之后（且距上一个不算远）。
+      let nearCall = lastRegEnd >= 0 && idx >= lastRegEnd && idx - lastRegEnd < 4000
+      callRe.lastIndex = 0
+      let cm: RegExpExecArray | null
+      let candidatePos = -1
+      while ((cm = callRe.exec(text)) !== null) {
+        if (cm.index <= idx) { candidatePos = cm.index + 0 } else break
+      }
+      if (candidatePos >= 0 && idx - candidatePos < 4000) {
+        nearCall = true
+        lastRegEnd = idx + name.length
+      }
+      if (nearCall) found.add(name)
+    }
+  }
+  return [...found]
+}
+
+/** 快速统计目录内 js 文件数（仅用于深度/规模护栏）。 */
+function countFilesQuick(dir: string): number {
+  let n = 0
+  try {
+    for (const e of readdirSync(dir)) {
+      if (['node_modules', '.git', '.dsh-hot'].includes(e)) continue
+      try {
+        const st = statSync(join(dir, e))
+        if (st.isDirectory()) n += countFilesQuick(join(dir, e))
+        else if (e.endsWith('.js') || e.endsWith('.mjs')) n++
+      } catch { /* 忽略 */ }
+    }
+  } catch { /* 无法读取则计 0 */ }
+  return n
+}
+
+/** 对每个运行的 agent 热工具视图应用/解除某工具的 deny（真禁注入）。能力不可用（拿不到 agents 或 scoped ctx）
+ * 时返回 false，且不抛——开关持久化照常落 overlay，restrict 由宿主能力决定。 */
+function applyToolRestrict(ctx: Context, name: string, deny: boolean): boolean {
+  let agents: { get?(id: string): unknown; store?: unknown } | undefined
+  try { agents = (ctx as { get?(k: string): unknown }).get?.('agents') as typeof agents } catch { agents = undefined }
+  if (!agents || typeof agents.get !== 'function') return false
+  // agents 服务暴露 entry 的方式因宿主而异：尝试遍历 store / 或假定其上有可迭代会话。无法枚举则只尽力。
+  const candidates = new Set<unknown>()
+  try {
+    const store = (agents as { store?: unknown }).store
+    if (store && typeof store === 'object') {
+      for (const v of Object.values(store as Record<string, unknown>)) {
+        const entry = v as { session?: unknown; agent?: unknown }
+        if (entry?.agent) candidates.add(entry.agent)
+        else if (entry?.session) candidates.add(entry.session)
+      }
+    }
+  } catch { /* 枚举失败则走空 */ }
+  if (candidates.size === 0) {
+    // 兜底：尝试取任意单一 agent ctx（若 agents 直接挂在 ctx 上）。
+    try {
+      const anyAgent = (agents as { requireInitiator?(): unknown }).requireInitiator?.()
+      if (anyAgent) candidates.add(anyAgent)
+    } catch { /* 忽略 */ }
+  }
+  if (candidates.size === 0) return false
+  let appliedAny = false
+  for (const ag of candidates) {
+    const scopeCtx = ((ag as { ctx?: unknown }).ctx ?? (ag as { scope?: { ctx?: unknown } }).scope?.ctx) as
+      | { tools?: { restrict?(f: { deny: string[] }): unknown } }
+      | undefined
+    if (!scopeCtx || typeof scopeCtx.tools?.restrict !== 'function') continue
+    try {
+      scopeCtx.tools.restrict({ deny: deny ? [name] : [] })
+      appliedAny = true
+    } catch { /* 该 agent 视图不接受则跳过 */ }
+  }
+  return appliedAny
+}
+
+/** 由 tempLoad 入参解析本地包源目录（file:/link:/绝对路径）；裸名（registry）返回 null，不可换键。 */
+function packageSourceDir(spec: string): string | null {
+  const s = spec.trim()
+  let p = s
+  if (s.startsWith('file:')) p = s.slice('file:'.length)
+  else if (s.startsWith('link:')) p = s.slice('link:'.length)
+  else if (!/^[A-Za-z]:[\\/]|^(\/|\\)/.test(s)) return null
+  return p || null
+}
+
+/** 复制源包目录为临时换取键副本，并改写副本 package.json.name；返回副本目录。全程只碰副本，源码零改动。 */
+function makeHotCopy(srcDir: string, profileDir: string, basePackageName: string): string {
+  const hotRoot = join(profileDir, '.dsh-hot')
+  mkdirSync(hotRoot, { recursive: true })
+  const next = `${basePackageName}-hot${++hotSeq}`
+  const dst = join(hotRoot, next)
+  rmSync(dst, { recursive: true, force: true })
+  // 只排全场景必然垃圾项，不再猜 dist/build——它们对多数插件是中间产物，但可能是别的插件运行时命脉（如 ego-browser 的前端），一刀切会误伤。
+  cpSync(srcDir, dst, {
+    recursive: true,
+    filter: (s) => {
+      const n = basename(s)
+      return n !== 'node_modules' && n !== '.git' && n !== '.dsh-hot'
+    },
+  })
+  const pkgJsonPath = join(dst, 'package.json')
+  if (!existsSync(pkgJsonPath)) throw new Error(`副本缺少 package.json（源 ${srcDir} 非有效插件包）`)
+  const meta = JSON.parse(readFileSync(pkgJsonPath, 'utf8')) as { name?: string }
+  meta.name = next
+  writeFileSync(pkgJsonPath, JSON.stringify(meta, null, 2) + '\n')
+  return dst
+}
 
 /** —— 步骤引擎（热插拔操作的过程追踪）——
  * 以「预定义步骤计划 + 每个步骤独立状态」的方式输出操作进度，供前端：
@@ -955,6 +1349,12 @@ interface StepRun {
 
 let _runSeq = 0
 const _runs = new Map<string, StepRun>()
+
+/** agent 触发的「刷新渲染进程」请求（前端轮询消费）。nonce 去重、读后清空、TTL 防陈旧。
+ * 仅登记「触发」，无任何检测——媒体护栏（预检/门禁）由 agent 自行编排 pm_verifyPreflight 等工具。 */
+let pendingReload: { ts: number; nonce: string } | null = null
+/** 刷新信号的有效窗口：agent 登记后前端须在此时间内轮询到，否则视为陈旧丢弃。 */
+const RELOAD_SIGNAL_TTL = 10_000
 
 /** 各种操作对应的步骤计划（beginStep 预创建前端骨架、真实操作按步推进用）。 */
 const ALL_PLANS: Record<string, StepPlanItem[]> = {
@@ -1048,7 +1448,7 @@ async function tempLoad(
   host: SimpleManagerHost | null,
   spec: string,
   runId: string,
-): Promise<{ depsApplied: boolean; pnpmReason?: string; hotApplied: boolean; packageName: string; entryId?: string; state?: string; officialPeers?: string[]; runId: string }> {
+): Promise<{ depsApplied: boolean; pnpmReason?: string; hotApplied: boolean; packageName: string; entryId?: string; state?: string; officialPeers?: string[]; runId: string; hasClient: boolean }> {
   const name = spec.trim()
   if (!name) throw new Error('缺少要临时加载的插件名')
 
@@ -1060,17 +1460,54 @@ async function tempLoad(
     finishRun(run)
   }
 
-  // 1) 真实装包 + 拉齐依赖闭包。依赖获取失败即中止：不再继续 loader.create，避免把「装一半」的
-  //    半残实例挂进运行内核（依赖未到位 → create 仍可能 apply 成功 → 路由/服务被占、且残留为
-  //    无法回收的幽灵 active 实例，P-036/P-043 实证）。
+  // 1) 依赖闭包在 resolve/换键之后装配（见下 deps 步）。
   let depsApplied = false
   let pnpmReason: string | undefined
   let installedDeps: string[] = []
+
+  // 2) 解析真实包名 + 自动换键（须在 pnpmAdd/装配之前）。
+  // P-052 机制：宿主拿不到 Node 内部 loadCache（Electron no-realm），模块地图按 specifier 键控、
+  // 进程内无公开失效手段——同名包本进程加载过（含已 tempRemove）时，重装同 specifier 必命中旧模块缓存。
+  // 故检测到「本进程已加载过同名」且入参为本地包目录时：复制一份临时副本（profile/.dsh-hot/<新名>）并
+  // 改写副本 package.json.name 换到全新 specifier 取新码——新 specifier + 新 realpath 双重换键，必读新盘；
+  // 源码目录全程零改动。换键原因以 warn + resolve note 透明告知 agent。
+  markStep(run, 'resolve', 'running')
+  let packageName = specPackageName(name, host?.profileDir ?? undefined) ?? name
+  let rekeyNote: string | undefined
+  let hotCopyDir: string | undefined
+  if (host?.profileDir && seenLocalNames.has(packageName)) {
+    const srcDir = packageSourceDir(name)
+    if (srcDir && existsSync(srcDir)) {
+      try {
+        const srcMeta = JSON.parse(readFileSync(join(srcDir, 'package.json'), 'utf8')) as { name?: string }
+        const base = String(srcMeta.name ?? packageName).replace(/-hot\d+$/, '')
+        hotCopyDir = makeHotCopy(srcDir, host.profileDir, base)
+        packageName = String((JSON.parse(readFileSync(join(hotCopyDir, 'package.json'), 'utf8')) as { name?: string }).name)
+        hotCopyDirs.set(packageName, hotCopyDir)
+        rekeyNote = `同名「${base}」已在本进程加载过：宿主无法回收 Node 模块缓存，已自动复制临时副本「${packageName}」并改写其包名以换取全新 specifier。副本名带 -hotN 且按新名字装配，可能带来：① 注册/存储用包名做键的插件状态（session、channel 路由、持久目录）会落在「副本名下」，与原名的数据隔离、不互通；② 若 packJson 或签名/产物内引用自身原名，改名后可能失配（license/Map 校验类）。副本用后即删（pm_tempRemove）不累积，转正(pm_promote)后以原名持久、不再用副本。`
+      } catch (e) {
+        rekeyNote = `同名「${packageName}」已在本进程加载过，但复制换键失败：${e instanceof Error ? e.message : String(e)}；本轮仍会命中旧模块缓存`
+      }
+    } else {
+      rekeyNote = `同名「${packageName}」已在本进程加载过，但入参非本地包目录，无法复制换键；本轮仍会命中旧模块缓存`
+    }
+  }
+  seenLocalNames.add(packageName)
+  markStep(run, 'resolve', 'ok', rekeyNote ? `${packageName}（已自动复制换键）` : packageName)
+  if (rekeyNote) appendNote(run, 'warn', rekeyNote)
+  if (tempInfos.has(packageName)) { fail(`「${packageName}」已经临时加载过了`); throw new Error(`「${packageName}」已经临时加载过了`) }
+  if (typeof ctx.loader.create !== 'function') { fail('loader.create 不可用，无法运行时热装'); throw new Error('loader.create 不可用，无法运行时热装') }
+
+  // 1) 真实装包 + 拉齐依赖闭包。依赖获取失败即中止：不再继续 loader.create，避免把「装一半」的
+  //    半残实例挂进运行内核（依赖未到位 → create 仍可能 apply 成功 → 路由/服务被占、且残留为
+  //    无法回收的幽灵 active 实例，P-036/P-043 实证）。
   markStep(run, 'deps', 'running')
   if (host && host.profileDir) {
+    // 换键时以副本目录为 file: 源（pnpm 依副本新 name 装配）；否则用原始 spec。
     // 热装跳过官方业务 peer：不把 @deepseek-ai/dsh-* 装进 profile，让桌面壳 overlay 回落选发行 install 来源，
     // 规避其对「动态热装」官方 peer 二次解析的限制（P-033 设计，官方业务包由发行内嵌提供、无需 profile 重复安装）。
-    const out = await pnpmAdd(host.profileDir, name, { skipOfficialPeers: true })
+    const specForInstall = hotCopyDir ? 'file:' + hotCopyDir : name
+    const out = await pnpmAdd(host.profileDir, specForInstall, { skipOfficialPeers: true })
     depsApplied = out.ok
     if (!depsApplied) {
       pnpmReason = out.message
@@ -1085,13 +1522,6 @@ async function tempLoad(
     fail('profileDir 缺失，无法安装依赖——失败即中止，未装配插件')
     throw new Error('profileDir 缺失，无法安装依赖')
   }
-
-  // 2) packageName = 插件真实包名（装包后由 package.json 解析，路径/registry 均可）。
-  markStep(run, 'resolve', 'running')
-  const packageName = specPackageName(name, host?.profileDir ?? undefined) ?? name
-  markStep(run, 'resolve', 'ok', packageName)
-  if (tempInfos.has(packageName)) { fail(`「${packageName}」已经临时加载过了`); throw new Error(`「${packageName}」已经临时加载过了`) }
-  if (typeof ctx.loader.create !== 'function') { fail('loader.create 不可用，无法运行时热装'); throw new Error('loader.create 不可用，无法运行时热装') }
 
   // 官方业务 peer 探测：含 @deepseek-ai/dsh-* 时提示桌面壳 overlay 解析限制（不阻塞）。
   const officialPeers = detectOfficialPeerDeps(packageName, host?.profileDir ?? undefined)
@@ -1112,6 +1542,36 @@ async function tempLoad(
 
   // 3) 运行时热装：create 的 promise resolve = entry 装配/apply 成功；import 或 apply 失败时 reject。
   markStep(run, 'assemble', 'running')
+  // P-052 模块缓存驱逐：tempRemove/uninstall 只拆装配树与磁盘包，不清 Node ESM loadCache——
+  // 同名包在本进程加载过又重装回同一路径时，create 的 import() 命中旧 ModuleJob，装配的是旧代码、
+  // 顶层副作用也不重跑（probe 残留/channel 复活的根因，实测复现：拆净+改码+重装仍取旧版）。
+  // 故装配前按包真实目录驱逐 loadCache + require.cache（HMR partialReload 同款术），让 import
+  // 未命中、读盘取新码。只清包自身目录，共享依赖不动（保持单实例）；不可用时降级为旧行为不阻断。
+  // P-052 CTX 诊断：无条件打印驱逐判定链上的实际变量，定位「同名热装不生效」墙上哪一处。
+  // 保留原分支逻辑；诊断信息始终进装配日志（标记 [evict-dx]），不论 evicted 是否 0、是否命中 if。
+  const __dx = [`[evict-dx] node=${process.versions.node}`, `electron=${process.versions.electron ?? '-'}`, `inElectron=${!!process.versions.electron}`, `exec=${basename(process.execPath)}/argv0=${basename(process.argv0 ?? '?')}`, `profileDir=${String(host?.profileDir)}`, `packageName=${packageName}`]
+  const pkgDir = host?.profileDir ? join(host.profileDir, 'node_modules', packageName) : ''
+  __dx.push(`pkgDir=${pkgDir}`, `exists=${pkgDir ? existsSync(pkgDir) : false}`)
+  if (host?.profileDir && pkgDir && existsSync(pkgDir)) {
+    let realDir = pkgDir
+    try { realDir = realpathSync(pkgDir) } catch { /* realpath 失败退回表面路径 */ }
+    __dx.push(`realDir=${realDir}`)
+    const ev = evictPackageModuleCaches(ctx.loader, realDir)
+    __dx.push(`evict={ok:${ev.ok}, src:${ev.source}, esm:${ev.evictedEsm}, cjs:${ev.evictedCjs}${ev.reason ? ', reason:' + ev.reason : ''}${ev.diagnosis ? ', why:' + ev.diagnosis : ''}}`)
+    appendNote(run, 'info', __dx.join(' · '))
+    if (!ev.ok) {
+      console.log(`[dsh-simplemanager] 模块缓存驱逐不可用（${ev.reason}）：同名重装将命中旧模块缓存`)
+    } else if (ev.evictedEsm + ev.evictedCjs > 0) {
+      appendNote(run, 'info', `已驱逐同名旧模块缓存 ${ev.evictedEsm + ev.evictedCjs} 条（ESM ${ev.evictedEsm} / CJS ${ev.evictedCjs}），本次装配取磁盘新码`)
+    }
+  } else {
+    appendNote(run, 'info', __dx.join(' · '))
+  }
+  // collectRun 只携带步骤状态 note、不含 info 级 lines——merged 到 resolve 步 note，
+  // 让 agent 在 OpResult.steps 里直接读到 [evict-dx]（resolve 必先于 create 成功，任何路径可见）。
+  const _dxNote = `[evict-dx] ${__dx.join(' · ')}`
+  const _rs = run.states.get('resolve')
+  if (_rs) _rs.note = _rs.note ? `${_rs.note} · ${_dxNote}` : _dxNote
   // P-043 失败清理基准：create 前既有 entry id。create 抛错后按包名再探一次，凡本次新出现的半挂 entry
   // 一律拆掉（apply 失败的重叠实例会占用路由/服务/资源），既有健康实例（装前已存在）保持不动，避免误杀。
   let entryIdBeforeCreate: string | undefined
@@ -1173,9 +1633,10 @@ async function tempLoad(
   } catch { /* 读态失败不影响结果 */ }
   markStep(run, 'state', 'ok', state ?? 'active')
 
-  // 5) 镜像临时态（面板展示、卸载引用计数用）。spec 保留原始输入，供 promote 原样 re-add。
+  // 5) 镜像临时态（面板展示、卸载引用计数用）。spec 保留原始输入，供 promote 原样 re-add；换键时
+  //    spec 记录为副本 file: 源，使 tempRemove 依副本新名正确拆 entry + 清物理。
   markStep(run, 'finish', 'running')
-  tempInfos.set(packageName, { entryId, spec: name, installedDeps })
+  tempInfos.set(packageName, { entryId, spec: hotCopyDir ? 'file:' + hotCopyDir : name, installedDeps, hotCopy: hotCopyDir })
   host?.pushHotInstall(packageName)
   // 热装 = 重新安装该插件：清掉本会话的「已卸载待消失」标记，否则 buildView 会把它过滤掉，点了热装却不见卡。
   // 注意不能靠「live 是否命中」判断——「卸载但装配未拆干净、待重启消失」的插件一样 live 命中，
@@ -1183,7 +1644,7 @@ async function tempLoad(
   recentlyUninstalled.delete(packageName)
   markStep(run, 'finish', 'ok', state ?? 'active')
   finishRun(run)
-  return { depsApplied, pnpmReason, hotApplied: true, packageName, entryId, state, officialPeers, runId }
+  return { depsApplied, pnpmReason, hotApplied: true, packageName, entryId, state, officialPeers, runId, hasClient: clientArt.declared }
 }
 
 /** 探测插件的「官方业务 peer」：peerDependencies 中含 `@deepseek-ai/dsh-*`（被桌面壳 overlay 管理，
@@ -1237,6 +1698,11 @@ async function tempRemove(ctx: AppContext, host: SimpleManagerHost | null, name:
         if (neededByOther) continue
         await pnpmRemove(host.profileDir, dep).catch(() => { /* 回收尽力而为，失败不阻断卸载 */ })
       }
+    }
+    // 换键副本回收：热装换键时生成的 .dsh-hot/<新名> 副本随卸载即删，致零残留（源码目录不受影响）。
+    if (info.hotCopy) {
+      try { rmSync(info.hotCopy, { recursive: true, force: true }) } catch { /* 清理尽力而为 */ }
+      hotCopyDirs.delete(packageName)
     }
   }
   markStep(run, 'deps', 'ok')
@@ -1403,6 +1869,12 @@ async function uninstall(ctx: AppContext, host: SimpleManagerHost, name: string,
   delete overlay.notes[packageName]
   delete overlay.aliases[packageName]
   delete overlay.assignments[packageName]
+  // 卸载插件后，资源管理里归到该插件卡片的工具引用一并清空（回未分组），避免悬空卡片。
+  if (overlay.toolGroupOverrides) {
+    for (const [tool, key] of Object.entries(overlay.toolGroupOverrides)) {
+      if (key === packageName) delete overlay.toolGroupOverrides[tool]
+    }
+  }
   host.writeOverlay(overlay)
   // 用户要求「同时清除该插件缓存/配置」时：删除插件落在 home/.dsh 下的数据目录候选。
   // 候选取「完整包名 / 去 dsh- 前缀短名 / 去 @scope 作用域短名」三种、去重后只删存在的，
@@ -1464,4 +1936,156 @@ function readJsonBody(req: any): Promise<Record<string, unknown>> {
     })
     req.on('error', reject)
   })
+}
+
+/**
+ * —— 面向 agent 的执行器（v6）——
+ * 在 apply 闭包内构造，封装现有热插拔闭环（tempLoad/tempRemove/promote/uninstall）与只读体检
+ * （status/verifyPreflight/diagnose），供 agent-tools.ts 的 defineTool 薄装配。无 tools 宿主静默不注册。
+ *
+ * 每个变更操作都先 beginPlan 建 run 再调底层函数，返回时统一收敛为 OpResult（逐步结果 + 终态 +
+ * 是否残留），并把该 run 从内存清走（agent 一次性会话，不留无人消费的 run 快照）。
+ */
+function makeAgentOps(ctx: AppContext, host: SimpleManagerHost): AgentOps {
+  /** 从 run 快照收敛出 OpResult 的 steps / 残留判定，并回收该 run。 */
+  const collectRun = (action: OpResult['action'], runId: string): { steps: OpStep[]; hasErr: boolean; errNote?: string } => {
+    const run = _runs.get(runId)
+    _runs.delete(runId)
+    if (!run) return { steps: [], hasErr: false }
+    const steps: OpStep[] = [...run.states.values()].map((s) => ({
+      key: s.key,
+      status: s.status,
+      elapsed: s.elapsed,
+      note: s.note,
+    }))
+    const errStep = steps.find((s) => s.status === 'err')
+    return { steps, hasErr: steps.length > 0 && !!errStep, errNote: errStep?.note }
+  }
+
+  const status = (name: string): StatusDTO => {
+    const key = name.trim()
+    const bundle = host ? buildCatalog(ctx, host).find((b) => b.name === key) : undefined
+    const live = loaderLiveMap(ctx).get(key)
+    const info = tempInfos.get(key)
+    const livePhase = live?.phase ?? null
+    const scope = (bundle?.scope ?? 'third') as StatusDTO['scope']
+    const persistent =
+      !!host && (host.isBundleAssembled(key) || host.readPatchEnabledIds().has(key))
+    const isTemp = !!info
+    const present = !!(bundle || isTemp || live)
+
+    let phase: StatusDTO['phase']
+    if (!present) phase = 'absent'
+    else if (scope === 'official' || scope === 'shell') phase = livePhase === 'failed' ? 'failed' : 'running'
+    else if (isTemp) phase = 'temporary'
+    else if (persistent) phase = livePhase === 'failed' ? 'failed' : livePhase === 'active' ? 'running' : 'persistent'
+    else phase = 'orphan'
+
+    let hotLoadable = true
+    let reason: string | null = null
+    if (!key) { hotLoadable = false; reason = '缺少插件名' }
+    else if (scope === 'official' || scope === 'shell') { hotLoadable = false; reason = '官方/壳组件不可热装' }
+    else if (isTemp) { hotLoadable = false; reason = '已临时加载，先 pm_tempRemove 或 pm_promote' }
+    else if (persistent) { hotLoadable = false; reason = '已是持久安装，无需热装' }
+
+    return {
+      name: key,
+      present,
+      phase,
+      scope,
+      hotLoadable,
+      reason,
+      depCount: info?.installedDeps.length ?? 0,
+      // status 是同步快照，守卫未命中的具体服务名不在此详查：agent 需要时跑 pm_verifyPreflight。
+      pendingServices: [],
+      cleanupable: scope === 'third' && !!bundle && !isTemp && !persistent,
+      entryId: live?.entryId ?? info?.entryId ?? null,
+    }
+  }
+
+  const tempLoadOps = async (spec: string): Promise<OpResult> => {
+    const runId = beginPlan('tempLoad', ALL_PLANS.tempLoad)
+    let packageName: string | undefined
+    let hasClient: boolean | undefined
+    try {
+      const r = await tempLoad(ctx, host, spec, runId)
+      packageName = r.packageName
+      hasClient = r.hasClient
+    } catch (error) {
+      const { steps, errNote } = collectRun('tempLoad', runId)
+      return { ok: false, action: 'tempLoad', outcome: 'fail', steps, residue: true, error: errNote ?? (error instanceof Error ? error.message : String(error)) }
+    }
+    const { steps, hasErr, errNote } = collectRun('tempLoad', runId)
+    // 已装配但 entry 在 loader 门禁挂起 → not 真可调试，终态标记 pending 让 agent 知晓。
+    const live = packageName ? loaderLiveMap(ctx).get(packageName) : undefined
+    const outcome: OpResult['outcome'] = live?.phase === 'pending' ? 'pending' : 'pass'
+    // 仅带前端板块的插件才给 reload 引导：本次改动若要用户在面板查看/检查新前端则需 pm_reloadClient；
+    // 纯内核改动、用户无需查看时不出现。是否「需要用户看」由 agent 判断。
+    const hint = hasClient
+      ? '本插件带前端板块：若本次改动需要用户在面板查看/检查新前端（如新增卡片/组件/入口等可见内容），调用 pm_reloadClient 重载界面后在面板显现；若只是内部逻辑改动、用户无需查看，则无需重载。'
+      : undefined
+    return { ok: !hasErr, action: 'tempLoad', packageName, outcome, steps, residue: hasErr, error: errNote, hint }
+  }
+
+  const tempRemoveOps = async (name: string): Promise<OpResult> => {
+    const runId = beginPlan('tempRemove', ALL_PLANS.tempRemove)
+    try {
+      await tempRemove(ctx, host, name, runId)
+    } catch (error) {
+      const { steps, errNote } = collectRun('tempRemove', runId)
+      return { ok: false, action: 'tempRemove', outcome: 'fail', steps, residue: true, error: errNote ?? (error instanceof Error ? error.message : String(error)) }
+    }
+    const { steps, hasErr, errNote } = collectRun('tempRemove', runId)
+    return { ok: !hasErr, action: 'tempRemove', packageName: name, outcome: hasErr ? 'fail' : 'pass', steps, residue: hasErr, error: errNote }
+  }
+
+  const promoteOps = async (name: string): Promise<OpResult> => {
+    const runId = beginPlan('promote', ALL_PLANS.promote)
+    let packageName: string | undefined
+    try {
+      packageName = (await promote(ctx, host, name, runId)).packageName
+    } catch (error) {
+      const { steps, errNote } = collectRun('promote', runId)
+      return { ok: false, action: 'promote', outcome: 'fail', steps, residue: true, error: errNote ?? (error instanceof Error ? error.message : String(error)) }
+    }
+    const { steps, hasErr, errNote } = collectRun('promote', runId)
+    return { ok: !hasErr, action: 'promote', packageName, outcome: hasErr ? 'fail' : 'pass', steps, residue: hasErr, error: errNote }
+  }
+
+  const uninstallOps = async (name: string, clearData = false): Promise<OpResult> => {
+    const runId = beginPlan('uninstall', ALL_PLANS.uninstall)
+    let packageName: string | undefined
+    try {
+      packageName = (await uninstall(ctx, host, name, runId, clearData)).packageName
+    } catch (error) {
+      const { steps, errNote } = collectRun('uninstall', runId)
+      return { ok: false, action: 'uninstall', outcome: 'fail', steps, residue: true, error: errNote ?? (error instanceof Error ? error.message : String(error)) }
+    }
+    const { steps, hasErr, errNote } = collectRun('uninstall', runId)
+    return { ok: !hasErr, action: 'uninstall', packageName, outcome: hasErr ? 'fail' : 'pass', steps, residue: hasErr, error: errNote }
+  }
+
+  const verifyPreflight = async (specs: string[]): Promise<PreflightDTO[]> => {
+    const profileDir = host?.profileDir ?? undefined
+    return Promise.all(specs.filter((s) => s.trim() !== '').map(async (s) => {
+      // 入参可能是路径/file:/裸包名：先解析成真实包名（像 tempLoad 那样），打破「先装才有名」的鸡生蛋
+      const n = specPackageName(s.trim(), profileDir)
+      const r = await clientSmokeTest(n, locateClientRoots(n, profileDir, tempInfos.get(n)?.spec), profileDir, false, undefined)
+      return {
+        name: n,
+        ok: r.ok,
+        outcome: r.outcome,
+        steps: r.steps.map((s) => ({ name: s.name, ok: s.ok, detail: s.detail })),
+        error: r.error,
+      }
+    }))
+  }
+
+  const reloadClient = (): ReloadClientDTO => {
+    const nonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
+    pendingReload = { ts: Date.now(), nonce }
+    return { ok: true, nonce, note: '已登记刷新渲染进程请求；面板可见时前端轮询到即重载（仅刷新渲染进程，不重启内核，会话与热装状态保留，零检测）' }
+  }
+
+  return { status, tempLoad: tempLoadOps, tempRemove: tempRemoveOps, promote: promoteOps, uninstall: uninstallOps, verifyPreflight, reloadClient }
 }

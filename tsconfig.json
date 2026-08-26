@@ -13,7 +13,10 @@
     "rootDir": "src",
     "sourceMap": true,
     "types": ["node"],
-    "noEmitOnError": false
+    "noEmitOnError": false,
+    "paths": {
+      "@deepseek-ai/dsh-tools": ["../dsh-official/deepseek-harness-v0.1.1-rc.2/packages/core/tools/lib/types/index.d.ts"]
+    }
   },
   "include": ["src/index.ts", "src/host.ts", "src/shims.d.ts"]
 }

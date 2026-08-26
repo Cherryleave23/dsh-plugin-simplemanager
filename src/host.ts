@@ -42,6 +42,15 @@ export interface Overlay {
    * 用于跨重启清理热装物理残留：tempLoad 临时语义「重启即消失」，物理包也应随之回收，
    * 否则残留污染目录扫描列表（P-033）。 */
   hotInstalls: string[]
+  /** 工具管理（扫描分组）：被禁用的工具名集合。禁用后该工具描述不再注入 agent system prompt（省 token）。
+   * 键=工具名；每次扫描分组/开关时与真实可见工具对账，已不存在的工具立即清除（无幽灵）。 */
+  toolDeny: string[]
+  /** 工具管理（拖拽分组）：工具名 -> 手动指定的归属卡片 key（插件包名 或 自定义工具组卡 id）。手动覆盖优先于扫描分组自动归属；
+   * 每次扫描重建时，有记录的工具按覆盖值归组，其余仍按扫描结果。改名的工具随真实可见集消失即清理。
+   * 空/无记录 = 未分组（默认「未分组/未知」卡）。 */
+  toolGroupOverrides: Record<string, string>
+  /** 工具管理（自定义工具组卡）：卡 id -> {name}。资源管理特有容器，用于快捷管理工具，不进入插件管理页。 */
+  toolCats: Record<string, { name: string }>
 }
 
 export interface SimpleManagerConfig {
@@ -82,7 +91,7 @@ export class SimpleManagerHost {
   // ---- Overlay（分类 + 备注 + 闭包依赖 + 排序）持久化 ----
   readOverlay(): Overlay {
     if (this.overlayCache) return structuredClone(this.overlayCache.data)
-    const empty: Overlay = { folders: {}, assignments: {}, notes: {}, aliases: {}, closureDeps: {}, folderOrder: [], pluginOrder: {}, hotInstalls: [] }
+    const empty: Overlay = { folders: {}, assignments: {}, notes: {}, aliases: {}, closureDeps: {}, folderOrder: [], pluginOrder: {}, hotInstalls: [], toolDeny: [], toolGroupOverrides: {}, toolCats: {} }
     if (!existsSync(this.overlayFile)) {
       this.overlayCache = { raw: '', data: empty }
       return structuredClone(empty)
@@ -99,6 +108,9 @@ export class SimpleManagerHost {
         folderOrder: parsed.folderOrder ?? [],
         pluginOrder: parsed.pluginOrder ?? {},
         hotInstalls: parsed.hotInstalls ?? [],
+        toolDeny: parsed.toolDeny ?? [],
+        toolGroupOverrides: parsed.toolGroupOverrides ?? {},
+        toolCats: parsed.toolCats ?? {},
       }
       this.overlayCache = { raw, data }
       return structuredClone(data)
@@ -120,6 +132,9 @@ export class SimpleManagerHost {
         folderOrder: data.folderOrder,
         pluginOrder: data.pluginOrder,
         hotInstalls: data.hotInstalls,
+        toolDeny: data.toolDeny,
+        toolGroupOverrides: data.toolGroupOverrides,
+        toolCats: data.toolCats,
       },
       null,
       2,

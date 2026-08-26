@@ -91,6 +91,23 @@ interface PluginDiagnostic {
   summary: { ok: number; warn: number; err: number }
 }
 
+// —— 工具管理（第3栏）工具元数据：name + 启用态 + 描述 + 参数 schema（详情展开查看）——
+interface ToolMeta {
+  name: string
+  enabled: boolean
+  description: string
+  /** dsh-tools JSON Schema 子集（object-root），UI 只读展示字段名/类型/必填。 */
+  parameters?: { type?: string; properties?: Record<string, { type?: string; description?: string; required?: unknown }> }
+}
+
+/** 统一卡片抽象：kind='plugin' 复用插件管理插件卡；kind='toolcat' 为资源管理特有的自定义工具组卡。
+ * 每张卡承载 tools，标题别名/备注由宿主同步。 */
+interface ToolCatCard {
+  kind: 'plugin' | 'toolcat'
+  key: string
+  tools: ToolMeta[]
+}
+
 /** 统一确认弹窗请求。withClearData=true 时额外显示「同时清除缓存/配置」开关节。 */
 interface AskReq {
   title: string
@@ -143,6 +160,17 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   return (await res.json()) as T
 }
 
+/** 消费后端刷新信号：渲染进程存活即轮询，命中立即重载（随页面 reload 自动重建，无面板可见性依赖）。 */
+function startReloadPoller(): void {
+  window.setInterval(() => {
+    void api<{ ok: boolean; pending: boolean }>(`${API}/reloadSignal`)
+      .then((r) => {
+        if (r.ok && r.pending) window.location.reload()
+      })
+      .catch(() => { /* 单轮失败忽略，下一轮重试 */ })
+  }, 1200)
+}
+
 async function browse(): Promise<Browse> {
   return await api<Browse>(`${API}/browse`)
 }
@@ -192,6 +220,11 @@ export function apply(ctx: AppClientContext): void {
   // 作为设置里的独立板块呈现（设置 → 桌面管家）：
   // 用官方 settings.section slot（list scope=root），在设置导航列生成独立入口，
   // 而非嵌进官方「插件」section 的 plugins.tab。id/order/label 决定导航位。
+  // 模块级常驻轮询：渲染进程存活即消费后端刷新信号（不再受「插件管家面板是否打开/可见」影响）。
+  // 这样 pm_reloadClient 无论何时触发、用户是否在面板上，都能在 ≤1.2s 内被消费并刷新渲染进程，
+  // 让已热装的新前端代码对用户可见——这就是要的「效果」，不必依赖用户此刻正停在面板上。
+  startReloadPoller()
+
   ctx.slots.inject('settings.section', () =>
     ctx.slots.register(
       {
@@ -218,7 +251,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const [tempInput, setTempInput] = useState('')
   const [tempBusy, setTempBusy] = useState(false)
   /** 顶部导航：manage=插件管理 / hotswap=插件热插拔 / diagnose=插件诊断。 */
-  const [tab, setTab] = useState<'manage' | 'hotswap' | 'diagnose'>('manage')
+  const [tab, setTab] = useState<'manage' | 'hotswap' | 'toolmanage' | 'diagnose'>('manage')
   /** 操作日志条目（时间戳 + 级别 + 文本）：视图镜像持久 store，供热插拔栏查看与整段复制。 */
   const [logs, setLogs] = useState<LogEntry[]>(logStore.slice())
   /** 当前步骤骨架 + 实时状态（镜像 stepView）。 */
@@ -240,6 +273,27 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   /** 第三板块：代码规范治理诊断结果（按插件聚合）。 */
   const [diag, setDiag] = useState<PluginDiagnostic[]>([])
   const [diagBusy, setDiagBusy] = useState(false)
+  /** 工具管理（第3栏）：扫描分组结果 + 开关态 + 展开的插件卡牌/工具详情。 */
+  // 工具管理统一视图：默认 listTools（未分组大聚合）与增强 scanToolGroups（归到插件/工具组卡）同为该结构。
+  const [toolView, setToolView] = useState<{ toolCats: Array<{ id: string; name: string }>; cards: ToolCatCard[]; unassigned: ToolMeta[] } | null>(null)
+  const [toolScanned, setToolScanned] = useState(false)
+  const [toolScanBusy, setToolScanBusy] = useState(false)
+  /** 工具管理：当前展开的卡片 key（插件包名 / 工具组卡 id / '__unassigned'）。 */
+  const [expandedToolCard, setExpandedToolCard] = useState('')
+  /** 工具管理：工具搜索关键词（多态模糊匹配 名/描述/插件名/别名/备注）。 */
+  const [toolQuery, setToolQuery] = useState('')
+  /** 工具管理：当前展开详情查看的工具名（显示 description + schema）。 */
+  const [expandedToolDetail, setExpandedToolDetail] = useState('')
+  /** 工具管理：拖拽中的工具名。 */
+  const [draggedTool, setDraggedTool] = useState('')
+  /** 工具管理：拖拽 hover 落点（卡片 key）。 */
+  const [toolHoverKey, setToolHoverKey] = useState('')
+  /** 工具管理：正在内联改名的插件包名（空=未编辑）。与插件管理页共用 aliases，双边同步。 */
+  const [toolAliasEdit, setToolAliasEdit] = useState('')
+  /** 工具管理：正在内联改名的自定义工具组卡 id（空=未编辑）。 */
+  const [toolCatEdit, setToolCatEdit] = useState('')
+  /** 工具管理：新建自定义工具组卡输入框内容。 */
+  const [toolCatDraft, setToolCatDraft] = useState('')
   // 诊断范围（多选文件夹，localStorage 持久化，避免每次手动勾选）。空数组 = 全部第三方。
   const [diagFolders, setDiagFolders] = useState<string[]>(() => {
     try {
@@ -530,6 +584,328 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     // 启停成功信息已在下方操作日志记录，不再弹顶部绿色提示。
     pushLog(r.enabled ? 'ok' : 'info', `${r.enabled ? '启用' : '停用'}插件 ${p.name}（${applied}）`)
   }
+
+  /** 工具管理：加载工具视图。scan=false 走 listTools（默认平铺，未手动归属的全进未分组卡）；
+   * scan=true 走 scanToolGroups（增强：额外源码归组到插件卡）。拖动改归属后按当前模式重载以反映新归属。 */
+  const loadToolView = async (scan: boolean, opts?: { silent?: boolean }): Promise<void> => {
+    setToolScanBusy(true)
+    const endpoint = scan ? 'scanToolGroups' : 'listTools'
+    try {
+      const r = await api<{ ok: boolean; error?: string; toolCats: Array<{ id: string; name: string }>; cards: ToolCatCard[]; unassigned: ToolMeta[] }>(
+        `${API}/${endpoint}`,
+        { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) },
+      )
+      if (!r.ok) {
+        notify(r.error ?? (scan ? '扫描分组失败' : '加载工具失败'))
+        return
+      }
+      setToolView({ toolCats: r.toolCats ?? [], cards: r.cards ?? [], unassigned: r.unassigned ?? [] })
+      setToolScanned(scan)
+      if (!opts?.silent) {
+        const pluginCards = (r.cards ?? []).filter((c) => c.kind === 'plugin').length
+        pushLog(scan ? 'ok' : 'info', `工具管理：${scan ? `扫描分组完成（${pluginCards} 个插件卡）` : `已列出全部工具（${((r.cards ?? []).reduce((n, c) => n + c.tools.length, 0)) + (r.unassigned ?? []).length} 个）`}`)
+      }
+    } catch {
+      notify(scan ? '扫描分组异常' : '加载工具异常')
+    } finally {
+      setToolScanBusy(false)
+    }
+  }
+
+  /** 工具管理：进 tab 默认自动平铺全部工具（不分组），无需手动点按钮。 */
+  const autoLoadTools = useCallback(() => { void loadToolView(false) }, [])
+
+  /** 工具管理：运行态 —— 进入 tab 时自动加载一次（保持最新可见工具）。 */
+  useEffect(() => { if (tab === 'toolmanage') autoLoadTools() }, [tab])
+
+  /** 工具管理：切换单个工具启用态（写 overlay 持久 + 尝试真禁注入）。 */
+  const toggleTool = async (name: string, enabled: boolean): Promise<void> => {
+    const r = await api<{ ok: boolean; error?: string; enabled?: boolean; applied?: boolean }>(
+      `${API}/setToolEnabled`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name, enabled }) },
+    )
+    if (!r.ok) {
+      notify(r.error ?? '工具开关失败')
+      return
+    }
+    // 本地镜像更新（单工具）。
+    setToolView((prev) => (prev
+      ? {
+          ...prev,
+          cards: prev.cards.map((c) => ({ ...c, tools: c.tools.map((t) => (t.name === name ? { ...t, enabled } : t)) })),
+          unassigned: prev.unassigned.map((t) => (t.name === name ? { ...t, enabled } : t)),
+        }
+      : prev))
+    pushLog(r.enabled ? 'ok' : 'warn', `工具 ${name} ${r.enabled ? '已启用' : '已禁用'}${r.applied ? '（已对 agent 生效）' : ''}`)
+  }
+
+  /** 工具管理：整卡片总开关（names 批量统一态）——替代「全部禁用/全部启用」按钮。 */
+  const toggleCardAll = async (names: string[], enabled: boolean): Promise<void> => {
+    const r = await api<{ ok: boolean; error?: string; enabled?: boolean; applied?: boolean; names?: string[] }>(
+      `${API}/setToolEnabled`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ names, enabled }) },
+    )
+    if (!r.ok) {
+      notify(r.error ?? '整卡片开关失败')
+      return
+    }
+    const set = r.names ? new Set(r.names) : new Set(names)
+    setToolView((prev) => (prev
+      ? {
+          ...prev,
+          cards: prev.cards.map((c) => ({ ...c, tools: c.tools.map((t) => (set.has(t.name) ? { ...t, enabled } : t)) })),
+          unassigned: prev.unassigned.map((t) => (set.has(t.name) ? { ...t, enabled } : t)),
+        }
+      : prev))
+    pushLog(enabled ? 'ok' : 'warn', `已统一${enabled ? '启用' : '禁用'} ${set.size} 个工具${r.applied ? '（已对 agent 生效）' : ''}`)
+  }
+
+  /** 工具管理：拖拽工具改归属（持久化 toolGroupOverrides；key 空=回未分组）。刷新视图反映新归属。 */
+  const setToolGroup = async (tool: string, key: string): Promise<void> => {
+    const r = await api<{ ok: boolean; error?: string }>(
+      `${API}/setToolGroup`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tool, owner: key }) },
+    )
+    if (!r.ok) {
+      notify(r.error ?? '修改归属失败')
+      return
+    }
+    pushLog('info', `工具 ${tool} → ${key ? `卡片「${toolCardTitle(key)}」` : '未分组'}`)
+    void loadToolView(toolScanned) // 刷新分组视图，反映新的归属
+  }
+
+  /** 工具管理：新建自定义工具组卡（资源管理特有容器）。 */
+  const addToolCat = async (name: string): Promise<void> => {
+    const n = name.trim()
+    if (!n) return
+    const r = await api<{ ok: boolean; error?: string; id?: string }>(
+      `${API}/addToolCat`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: n }) },
+    )
+    if (!r.ok) { notify(r.error ?? '新建工具组卡失败'); return }
+    setToolCatDraft('')
+    pushLog('ok', `已新建工具组卡「${n}」`)
+    void loadToolView(toolScanned)
+  }
+
+  /** 工具管理：重命名自定义工具组卡。 */
+  const renameToolCat = async (id: string, name: string): Promise<void> => {
+    const n = name.trim()
+    setToolCatEdit('')
+    if (!n) return
+    const r = await api<{ ok: boolean; error?: string }>(
+      `${API}/renameToolCat`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, name: n }) },
+    )
+    if (!r.ok) { notify(r.error ?? '重命名失败'); return }
+    void loadToolView(toolScanned)
+  }
+
+  /** 工具管理：删除自定义工具组卡（归属其下的工具回未分组）。 */
+  const removeToolCat = async (id: string): Promise<void> => {
+    const r = await api<{ ok: boolean; error?: string }>(
+      `${API}/removeToolCat`,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }) },
+    )
+    if (!r.ok) { notify(r.error ?? '删除失败'); return }
+    void loadToolView(toolScanned)
+  }
+
+  /** 工具管理：插件显示名（共享别名 alias || 原名）。buildView 的 plugins 已含 alias，与插件管理页同源——单边改名另一边自动同步。 */
+  const displayAliasPl = (plugin: string): string => {
+    const p = plugins.find((x) => x.name === plugin)
+    return (p?.alias?.trim() || plugin)
+  }
+
+  /** 工具管理：卡片标题。plugin 卡用共享别名；toolcat 卡用自定义名称；关键兜底。 */
+  const toolCardTitle = (key: string): string => {
+    if (key === '__unassigned') return '未分组 / 未知工具'
+    const cat = toolView?.toolCats.find((c) => c.id === key)
+    if (cat) return cat.name
+    return displayAliasPl(key)
+  }
+
+  /** 工具管理：插件卡的备注（用于搜索匹配 + 展示）。 */
+  const pluginObjOf = (key: string): Plugin | undefined => plugins.find((p) => p.name === key)
+
+  /** 工具管理：内联改名提交（复用插件管理页同源 rename 接口，双边同步 + alias 空值清除）。 */
+  const saveToolAlias = async (plugin: string, alias: string): Promise<void> => {
+    setToolAliasEdit('')
+    const p = plugins.find((x) => x.name === plugin)
+    if (!p) return
+    if (alias.trim() === (p.alias ?? '').trim()) return
+    await renamePlugin(p, alias.trim())
+  }
+
+  /** 工具管理搜索：多态模糊匹配 工具名 / 工具描述 / 插件原名 / 插件别名 / 插件备注 / 工具组卡名。空查询不过滤。 */
+  const toolQueryMatch = (t: { name: string; description?: string }, cardKey?: string, cardKind?: string): boolean => {
+    const q = toolQuery.trim().toLowerCase()
+    if (!q) return true
+    const cntx = cardKey ? (cardKind === 'toolcat' ? toolCardTitle(cardKey) : [
+      cardKey,
+      pluginObjOf(cardKey)?.alias ?? '',
+      pluginObjOf(cardKey)?.note ?? '',
+    ].join(' ')) : ''
+    return [
+      t.name,
+      t.description ?? '',
+      cardKey ?? '',
+      cntx,
+    ].some((s) => (s || '').toLowerCase().includes(q))
+  }
+
+  /** 工具管理：面板内唯一工具行渲染（拖拽/开关/详情展开），三类卡片共用。 */
+  const renderToolRows = (tools: ToolMeta[], cardKey: string, cardKind: string) => {
+    const shown = tools.filter((t) => toolQueryMatch(t, cardKey, cardKind))
+    return (
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 }}>
+        {shown.map((t) => (
+          <div key={t.name} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} draggable onDragStart={() => setDraggedTool(t.name)} onDragEnd={() => setDraggedTool('')}>
+              <button
+                role="switch"
+                aria-checked={t.enabled}
+                onClick={() => void toggleTool(t.name, !t.enabled)}
+                style={t.enabled ? s.toolSwitchTrackOn : s.toolSwitchTrackOff}
+              >
+                <span style={t.enabled ? s.toolSwitchKnobOn : s.toolSwitchKnobOff} />
+              </button>
+              <span
+                style={{ fontSize: 12, fontFamily: 'var(--ds-font-family-code)', color: 'var(--dsw-alias-label-primary)', cursor: 'pointer', userSelect: 'none' }}
+                title={t.description || t.name}
+                onClick={() => setExpandedToolDetail(expandedToolDetail === t.name ? '' : t.name)}
+              >
+                {t.name}
+              </span>
+              <span style={{ fontSize: 10, color: 'var(--dsw-alias-label-tertiary)' }}>{'拖拽可移动归属'}</span>
+            </div>
+            {expandedToolDetail === t.name && (
+              <div style={s.toolDetailBox}>
+                {t.description ? <><b style={{ color: 'var(--dsw-alias-label-primary)' }}>{'描述'}</b>{'\n'}{t.description}</> : <span style={{ color: 'var(--dsw-alias-label-tertiary)' }}>{'（无描述）'}</span>}
+                {t.parameters?.properties && (
+                  <>
+                    {'\n\n'}<b style={{ color: 'var(--dsw-alias-label-primary)' }}>{'参数'}</b>
+                    {Object.entries(t.parameters.properties).map(([k, v]) => (
+                      <div key={k} style={s.toolSchemaRow}>
+                        <span style={{ fontFamily: 'var(--ds-font-family-code)', color: 'var(--dsw-alias-label-primary)' }}>{k}</span>
+                        <span style={{ color: 'var(--dsw-alias-label-secondary)' }}>{typeof (v as { type?: string }).type === 'string' ? (v as { type?: string }).type : ''}</span>
+                        {typeof (v as { description?: string }).description === 'string' && <span style={{ color: 'var(--dsw-alias-label-tertiary)' }}>{(v as { description?: string }).description}</span>}
+                      </div>
+                    ))}
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+        ))}
+        {shown.length === 0 && <div style={s.diagEmpty}>{'没有匹配搜索的工具'}</div>}
+      </div>
+    )
+  }
+
+  /** 工具管理：统一卡片（plugin / toolcat / unassigned）渲染。拖拽落点=卡片；整卡点击展开/收起。 */
+  const renderToolCard = (
+    cardKey: string,
+    cardKind: 'plugin' | 'toolcat' | 'unassigned',
+    tools: ToolMeta[],
+    title: string,
+    accent: 'plugin' | 'toolcat' | 'unassigned',
+    opts: { saveTitle?: (t: string) => void; editing: boolean; enterEdit?: () => void; note?: string; removable?: boolean },
+  ) => {
+    const open = expandedToolCard === cardKey
+    const disabledCount = tools.filter((t) => !t.enabled).length
+    const allOn = disabledCount === 0
+    const allOff = disabledCount === tools.length
+    const masterNext = allOn ? false : true
+    const accentColor = accent === 'plugin'
+      ? 'var(--dsw-alias-state-business-primary)'
+      : accent === 'toolcat'
+        ? 'var(--dsw-alias-state-warning-primary)'
+        : 'var(--dsw-alias-border-l2)'
+    return (
+      <div
+        key={cardKey}
+        style={{
+          ...s.diagCard,
+          borderLeft: `3px solid ${accentColor}`,
+          cursor: 'pointer',
+          outline: toolHoverKey === cardKey ? `2px solid ${accentColor}` : 'none',
+        }}
+        onClick={() => setExpandedToolCard(open ? '' : cardKey)}
+        onDragOver={(e) => { e.preventDefault(); if (draggedTool) setToolHoverKey(cardKey) }}
+        onDragLeave={() => setToolHoverKey((h) => (h === cardKey ? '' : h))}
+        onDrop={() => { if (draggedTool) { setToolHoverKey(''); void setToolGroup(draggedTool, cardKind === 'unassigned' ? '' : cardKey) } }}
+      >
+        <div style={s.diagCardHead}>
+          {opts.editing ? (
+            <input
+              autoFocus
+              defaultValue={title}
+              style={s.toolAliasInput}
+              onClick={(e) => e.stopPropagation()}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') opts.saveTitle?.((e.target as HTMLInputElement).value)
+                else if (e.key === 'Escape') { opts.saveTitle?.((e.target as HTMLInputElement).value); opts.enterEdit?.() }
+              }}
+              onBlur={(e) => opts.saveTitle?.(e.target.value)}
+            />
+          ) : opts.enterEdit ? (
+            <span
+              style={{ ...s.diagCardName, cursor: 'text' }}
+              title={opts.note ? `备注：${opts.note}\n点击改名` : '点击改名'}
+              onClick={(e) => { e.stopPropagation(); opts.enterEdit?.() }}
+            >
+              {title}
+            </span>
+          ) : (
+            <span style={s.diagCardName}>{title}</span>
+          )}
+          <span style={s.diagCardBadge}>{`${tools.length} 个工具`}</span>
+          {disabledCount > 0 && <span style={{ ...s.diagCardBadge, color: 'var(--dsw-alias-state-danger-primary)' }}>{`${disabledCount} 个已禁`}</span>}
+          {opts.removable && (
+            <button
+              style={s.toolCatActionDanger}
+              title="删除工具组卡（其下工具回未分组）"
+              onClick={(e) => { e.stopPropagation(); void removeToolCat(cardKey) }}
+            >
+              {'删除'}
+            </button>
+          )}
+          <span style={{ ...s.diagCardMeta, cursor: 'pointer', userSelect: 'none' }}>
+            {open ? '▲ 收起' : '▼ 展开'}
+          </span>
+          <button
+            role="switch"
+            aria-checked={allOn}
+            title={allOn ? '点击禁用全部' : '点击启用全部'}
+            onClick={(e) => { e.stopPropagation(); void toggleCardAll(tools.map((t) => t.name), masterNext) }}
+            style={allOn ? s.toolSwitchTrackOn : s.toolSwitchTrackOff}
+          >
+            <span style={allOn ? s.toolSwitchKnobOn : s.toolSwitchKnobOff} />
+          </button>
+        </div>
+        <div style={s.diagCardMeta}>{'共 ' + tools.filter((t) => t.enabled).length + ' 个启用'}{opts.note ? ' · 备注：' + opts.note : ''}</div>
+        {open && renderToolRows(tools, cardKey, cardKind)}
+      </div>
+    )
+  }
+
+  /** 工具管理：按插件管理的文件夹把插件卡分组（复用同一套文件夹结构，排布一致）。只在有卡时显示对应文件夹。 */
+  const pluginFolderBuckets = useMemo(() => {
+    const pc = toolView?.cards.filter((c) => c.kind === 'plugin') ?? []
+    const byFolder = new Map<string, ToolCatCard[]>()
+    for (const c of pc) {
+      const fid = pluginObjOf(c.key)?.folder ?? 'third'
+      if (!byFolder.has(fid)) byFolder.set(fid, [])
+      byFolder.get(fid)!.push(c)
+    }
+    const ids = [...byFolder.keys()]
+    const orderedIds = [
+      ...folders.filter((f) => ids.includes(f.id)).map((f) => f.id),
+      ...ids.filter((id) => !folders.some((f) => f.id === id)),
+    ]
+    return orderedIds.map((fid) => ({ id: fid, name: folders.find((f) => f.id === fid)?.name ?? fid, cards: byFolder.get(fid)! }))
+  }, [toolView, folders, plugins])
 
   const tempLoad = async (): Promise<void> => {
     const name = tempInput.trim()
@@ -979,12 +1355,13 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
 
       <div style={s.tabBar}>
         {(
-          [
-            ['manage', '插件管理'],
-            ['hotswap', '插件热插拔'],
-            ['diagnose', '插件诊断'],
-          ] as const
-        ).map(([key, label]) => (
+            [
+              ['manage', '插件管理'],
+              ['hotswap', '插件热插拔'],
+              ['toolmanage', '工具管理'],
+              ['diagnose', '插件诊断'],
+            ] as const
+          ).map(([key, label]) => (
           <button
             key={key}
             style={{ ...s.tabBtn, ...(tab === key ? s.tabBtnActive : {}) }}
@@ -1219,6 +1596,87 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
                 ))
               )}
             </div>
+          </div>
+        </div>
+      )}
+
+      {tab === 'toolmanage' && (
+        <div style={s.diagnosePanel}>
+          <div style={s.diagHead}>
+            <div style={s.diagHeadText}>
+              <span style={s.diagnoseTitle}>{'工具管理'}</span>
+              <span style={s.diagHint}>{'默认扫出全部工具（落在「未分组」大卡）；点「扫描分组」增强：按插件管理的文件夹层级把可判定工具归档到所属插件卡。开关：开机绿 / 关红，关闭后该工具描述不再注入 agent system prompt（省 token）。点击卡片展开工具，点击工具查看描述与参数；拖拽工具可移动归属（持久化）；工具组卡仅此处使用，不进入插件管理页。'}</span>
+            </div>
+            <input
+              style={s.toolSearchInput}
+              placeholder="搜索工具名 / 描述 / 插件名 / 别名 / 备注…"
+              value={toolQuery}
+              onChange={(e) => setToolQuery(e.target.value)}
+            />
+            <button style={s.diagRunBtn} onClick={() => void loadToolView(!toolScanned)} disabled={toolScanBusy}>
+              {toolScanBusy ? '加载中…' : (toolScanned ? '⛁ 回到未分组' : '⛁ 扫描分组')}
+            </button>
+          </div>
+
+          <div style={s.diagList}>
+            {toolView === null ? (
+              <div style={s.diagEmpty}>{'加载工具列表…'}</div>
+            ) : (
+              <>
+                {/* 未分组 / 未知工具：默认大聚合卡，收纳所有未归属工具，也是拖拽回未分组的落点。 */}
+                {renderToolCard('__unassigned', 'unassigned', toolView.unassigned, '未分组 / 未知工具', 'unassigned', {
+                  editing: false,
+                  note: toolScanned ? '源码无法判定的工厂动态名 / 外壳打包来源不明工具' : '默认形态：未手动归属的工具都在此；点「扫描分组」自动归档到插件卡',
+                })}
+
+                {/* 工具组卡片（资源管理特有，快捷分组） */}
+                <div style={s.toolSectionHeader}>
+                  <span style={s.toolSectionTitle}>{'工具组卡片'}</span>
+                  <span style={s.toolSectionCount}>{`${toolView.cards.filter((c) => c.kind === 'toolcat').length} 张 · 仅此页可见，快捷管理`}</span>
+                </div>
+                <div style={s.toolCatCreateRow}>
+                  <input
+                    style={s.toolCatDraftInput}
+                    placeholder="新建工具组卡名称…"
+                    value={toolCatDraft}
+                    onChange={(e) => setToolCatDraft(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter') void addToolCat(toolCatDraft) }}
+                  />
+                  <button style={s.diagRunBtn} onClick={() => void addToolCat(toolCatDraft)} disabled={!toolCatDraft.trim()}>{'+ 新建工具组卡'}</button>
+                </div>
+                {toolView.cards.filter((c) => c.kind === 'toolcat').map((c) => (
+                  renderToolCard(c.key, 'toolcat', c.tools, toolCardTitle(c.key), 'toolcat', {
+                    editing: toolCatEdit === c.key,
+                    saveTitle: (t) => void renameToolCat(c.key, t),
+                    enterEdit: () => setToolCatEdit(c.key),
+                    removable: true,
+                    note: '独立工具组卡：拖工具进来做快捷分组',
+                  })
+                ))}
+
+                {/* 插件分组：复用插件管理的文件夹层级 */}
+                {pluginFolderBuckets.map((fb) => (
+                  <div key={fb.id}>
+                    <div style={s.toolSectionHeader}>
+                      <span style={s.toolSectionTitle}>{fb.name}</span>
+                      <span style={s.toolSectionCount}>{`${fb.cards.length} 个插件卡`}</span>
+                    </div>
+                    {fb.cards.map((c) => {
+                      const pl = pluginObjOf(c.key)
+                      return renderToolCard(c.key, 'plugin', c.tools, displayAliasPl(c.key), 'plugin', {
+                        editing: toolAliasEdit === c.key,
+                        saveTitle: (t) => void saveToolAlias(c.key, t),
+                        enterEdit: () => setToolAliasEdit(c.key),
+                        note: pl?.note?.trim() || '',
+                      })
+                    })}
+                  </div>
+                ))}
+                {pluginFolderBuckets.length === 0 && (
+                  <div style={s.diagEmpty}>{'扫描分组后可把工具归档到所属插件卡（按插件管理文件夹排布）。'}</div>
+                )}
+              </>
+            )}
           </div>
         </div>
       )}
