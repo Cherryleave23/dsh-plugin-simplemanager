@@ -433,7 +433,12 @@ async function runPnpm(profileDir: string, args: readonly string[], timeoutMs: n
       })
     }
     child.on('error', (error) => finish({ code: 127, spawnError: error.message }))
-    child.on('close', () => finish({}))
+    child.on('close', () => {
+      // pnpm 进程退出时若最后一行错误 JSON 无尾随换行，会滞留在 lineBuffer 不被解析；
+      // 冲刷一次保证真实错误不回落到笼统兜底（红色：退出码1无错误输出）。
+      if (lineBuffer.trim() !== '') sink(lineBuffer + '\n')
+      finish({})
+    })
   })
 }
 
@@ -547,7 +552,9 @@ export async function pnpmAdd(profileDir: string, spec: string, options: { timeo
   if (ascii !== null) {
     return { ok: false, code: 1, message: ascii }
   }
-  const args = ['add', arg, '--reporter=ndjson']
+  // 方案3加速：命中本地元数据缓存与共享 store，避免后续热装重复走网络。
+  // registry 镜像不在此硬编码，交由 profile/用户级 .npmrc 透传（跨环境通用）。
+  const args = ['add', arg, '--reporter=ndjson', '--prefer-offline']
   // 热装默认关闭 auto-install-peers：避免 pnpm 自动把插件声明的官方业务 peer 拉进 profile
   // （P-033，官方 @deepseek-ai/dsh-* 由发行内嵌提供，profile 重复落盘反而触发 overlay 二次解析限制）。
   if (options.skipOfficialPeers) args.push('--config.auto-install-peers=false')
@@ -564,7 +571,7 @@ export async function pnpmAdd(profileDir: string, spec: string, options: { timeo
     const specs_ = filteredIds.size ? specs.filter((s, i) => !(filteredIds.has(names[i]) && isOfficialSystemDep(names[i]))) : specs
     const names_ = filteredIds.size ? names.filter((n) => !filteredIds.has(n)) : names
     if (specs_.length === 0) return { ok: true, code: 0, message: '依赖安装成功（仅保留非官方依赖，官方业务 peer 由发行内嵌提供）', installedDeps: names_ }
-    const closure = await runPnpm(profileDir, ['add', ...specs_, '--reporter=ndjson'], timeoutMs)
+    const closure = await runPnpm(profileDir, ['add', ...specs_, '--reporter=ndjson', '--prefer-offline'], timeoutMs)
     if (closure.code === 0 && !closure.timedOut) {
       return { ok: true, code: 0, message: `依赖安装成功（含 ${specs_.length} 项依赖闭包${filteredIds.size ? `，跳过 ${filteredIds.size} 项官方业务 peer` : ''}）`, installedDeps: names_ }
     }
@@ -602,7 +609,8 @@ export async function pnpmAdd(profileDir: string, spec: string, options: { timeo
     break // 非可分类失败：不再盲目重试
   }
 
-  const reason = last?.pnpmError ?? last?.spawnError ?? lastLines(last?.stderr ?? '')
+  const rawTail = lastLines(last?.stderr ?? '') || lastLines(last?.stdout ?? '')
+  const reason = last?.pnpmError ?? last?.spawnError ?? rawTail
   const codeInfo = last?.pnpmErrorCode ? `（${last.pnpmErrorCode}）` : ''
   const fallback = `pnpm 退出码 ${last?.code ?? '未知'} 且未捕获到错误输出（真实错误走 ndjson，可能未落到本次管道）。请到 pnpm 日志或 profile 的 node_modules/.pnpm 校验状态`
   return { ok: false, code: last?.code ?? 1, message: `pnpm add 失败${codeInfo}: ${reason || fallback}` }

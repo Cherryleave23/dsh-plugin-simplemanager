@@ -151,7 +151,7 @@ export const s: Record<string, CSSProperties> = {
   stepRight: { marginLeft: 'auto', display: 'flex', gap: 8, flexShrink: 0 },
     stepMeta: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)' },
     stepNote: { maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
-  // 诊断占位
+  // 工具管理面板容器（复用诊断同名布局样式）
   diagnosePanel: {
     display: 'flex',
     flexDirection: 'column',
@@ -166,26 +166,7 @@ export const s: Record<string, CSSProperties> = {
     boxShadow: 'var(--dsw-shadow-lv1)',
     textAlign: 'center',
   },
-  diagnoseTitle: { fontSize: 15, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
-  diagnoseEmpty: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', maxWidth: 420 },
-  diagFolderBar: { display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 6 },
-  diagFolderLabel: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', fontWeight: 500, marginRight: 2 },
-  diagChip: {
-    display: 'flex',
-    alignItems: 'center',
-    gap: 4,
-    padding: '3px 8px',
-    borderRadius: 6,
-    fontSize: 12,
-    cursor: 'pointer',
-    background: 'var(--dsw-alias-bg-layer-2)',
-    border: '1px solid var(--dsw-alias-border-l1)',
-    color: 'var(--dsw-alias-label-secondary)',
-  },
-  // 代码规范治理面板
   diagHead: { display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12 },
-  diagHeadText: { display: 'flex', flexDirection: 'column', gap: 4, minWidth: 0 },
-  diagHint: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', maxWidth: 560 },
   diagRunBtn: {
     padding: '6px 14px', fontSize: 13, fontWeight: 600, cursor: 'pointer',
     borderRadius: 6, whiteSpace: 'nowrap',
@@ -193,9 +174,6 @@ export const s: Record<string, CSSProperties> = {
     background: 'linear-gradient(135deg, #3b82f6, #8b5cf6)',
     border: 'none',
   },
-  diagSummaryBar: { display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap', fontSize: 12 },
-  diagSummaryText: { color: 'var(--dsw-alias-label-primary)', fontWeight: 600 },
-  diagSummaryEll: { display: 'flex', gap: 12 },
   diagList: { display: 'flex', flexDirection: 'column', gap: 10, overflow: 'auto', flex: 1, minHeight: 0 },
   diagCard: {
     display: 'flex', flexDirection: 'column', gap: 8, padding: 12,
@@ -206,12 +184,7 @@ export const s: Record<string, CSSProperties> = {
   diagCardName: { fontSize: 13, fontWeight: 700, color: 'var(--dsw-alias-label-primary)', fontFamily: 'monospace' },
   diagCardBadge: { fontSize: 11, fontWeight: 600 },
   diagCardMeta: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', marginLeft: 'auto' },
-  diagRuleList: { display: 'flex', flexDirection: 'column', gap: 6 },
-  diagRuleRow: { display: 'flex', gap: 8, alignItems: 'flex-start' },
-  diagRuleMark: { fontSize: 13, fontWeight: 700, lineHeight: '18px', width: 14, flexShrink: 0 },
-  diagRuleTitle: { fontSize: 12, fontWeight: 600, color: 'var(--dsw-alias-label-primary)' },
-  diagRuleDetail: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)', marginTop: 2 },
-  diagEvid: { fontSize: 11, color: 'var(--dsw-alias-label-tertiary)', background: 'var(--dsw-alias-bg-layer-2)', padding: '3px 6px', borderRadius: 4, marginTop: 3, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' },
+  diagEmpty: { fontSize: 12, color: 'var(--dsw-alias-label-tertiary)', padding: '20px 0', textAlign: 'center' },
   kernelBanner: {
     display: 'flex',
     alignItems: 'center',

@@ -6,32 +6,33 @@
 
 ### 带前端的插件调试
 ```
-pm_verifyPreflight → pm_tempLoad → pm_reloadClient → 调试 → pm_tempRemove
+pm_probe(判定) → pm_tempLoad → pm_reloadClient → 调试 → pm_tempRemove
 ```
-> 插件有 UI 板块、改动需要用户在面板上看见时用这条。预检确认安全 → 热装 → 刷新界面让新前端显现 → 调试完热拆回收。
+> 插件有 UI 板块、改动需要用户在面板上看见时用这条。拿不准能否干净启动时先 `pm_probe`（独立隔离实例实测）→ 热装 → 刷新界面让新前端显现 → 调试完热拆回收。
 
 ### 不带前端的插件（纯逻辑/后端）
 ```
 pm_tempLoad → 调试 → pm_tempRemove
 ```
-> 纯内核/服务层改动，用户无需在面板查看。跳过预检和前端刷新，最简闭环。
+> 纯内核/服务层改动，用户无需在面板查看。直接最简闭环，无需判定与前端刷新。
 
 ## 闭环总览
 
 ```
-preflight → tempLoad → (status/diagnose) → tempRemove 或 promote
+(probe 判定,可选) → tempLoad → (status) → tempRemove 或 promote
                                     ↘ 若改动涉及前端 → reloadClient
 ```
 
 ## 标准流程
 
-### 1. 热装前预检（任何一次热装都不应跳过）
-对目标插件跑 `pm_verifyPreflight`（specs 传包名/路径/file:）。
+### 1. 判定插件能否干净启动（可选，用于拿不准时）
+对目标插件跑 `pm_probe`（specs 传包名/路径/file:），用外置隔离实例真实实测「能否干净启动、是否渲染」，返回逐步报告与归因。
 
-- `outcome == pass` 才继续 tempLoad
-- `pending`：注入服务不可达，会挂起 → 先修 inject 再装
-- `crash`：会真实崩溃 → 先修代码再装
-- 多个插件传入数组，一次预检齐
+- `outcome == pass` 再继续 tempLoad
+- `crash`/`hang`/`render-crash`：会真实崩溃/挂起 → 先修代码再装
+- `keep` 模式判定通过后可保留隔离实例（返回 keptUrl 供人工检查）
+- 多个候选传入数组，一次共存探针
+- 纯逻辑常规改动可信赖 tempLoad 自带的门禁，不必每次 probe
 
 ### 2. 临时热装
 `pm_tempLoad`，成功后**用返回的 packageName 作为后续一切操作的输入**（同名二次热装时可能带 `-hotN` 后缀，属正常，是换键机制的预期产物）。
@@ -53,7 +54,7 @@ preflight → tempLoad → (status/diagnose) → tempRemove 或 promote
 
 | 意图 | 工具 |
 |---|---|
-| 先确认安全 | `pm_verifyPreflight`（必做先行） |
+| 拿不准能否干净启动 | `pm_probe`（外置实例实测，可选） |
 | 装进运行时调试 | `pm_tempLoad` |
 | 看现状/残留 | `pm_status` |
 | 卸载临时 | `pm_tempRemove` |

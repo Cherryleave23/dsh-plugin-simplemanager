@@ -3,10 +3,10 @@
 > 使用时机：你需要用 `pm_*` 工具对第三方插件做「热装 → 调试 → 热卸/转正」闭环，或判断一个插件当前的装配/残留状态时，才读取本技能。不涉及插件管理时无需加载。
 
 ## 一句话
-`pm_*` 是插件管家暴露给你的插件热装调试工具。按其名称可猜作用：`pm_status` 查现状、`pm_tempLoad` 临时热装、`pm_tempRemove` 热卸、`pm_promote` 转正、`pm_uninstall` 彻底卸载、`pm_verifyPreflight` 预检、`pm_reloadClient` 刷新前端。
+`pm_*` 是插件管家暴露给你的插件热装调试工具。按其名称可猜作用：`pm_status` 查现状、`pm_tempLoad` 临时热装、`pm_tempRemove` 热卸、`pm_promote` 转正、`pm_uninstall` 彻底卸载、`pm_probe` 真实探针判定、`pm_reloadClient` 刷新前端。
 
 ## 核心流程（务必遵循）
-1. **预检先行**：任何热装前先 `pm_verifyPreflight`（传目标 spec），`outcome == 'pass'` 才继续。
+1. **判定先行（可选）**：拿不准某插件改动后能否干净启动时，先 `pm_probe`（独立隔离实例真实探针，`outcome == 'pass'` 才放心装）；常规纯逻辑改动可直接 `pm_tempLoad`。
 2. **热装**：`pm_tempLoad`。成功后**用返回的 packageName 接续**后续所有操作。
 3. **改名不慌**：同名二次热装返回名可能带 `-hotN` 后缀，是换键机制（复制临时副本绕开模块缓存）的预期产物，**不是错误**。继续用返回的新名。
 4. **收尾二选一**：`pm_promote` 转正保留 / `pm_tempRemove` 热卸回收（目标残留为零）。

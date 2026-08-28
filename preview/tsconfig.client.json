@@ -8,5 +8,5 @@
     "noEmit": true,
     "types": []
   },
-  "include": ["src/client.tsx", "src/client-rows.tsx", "src/client-styles.ts", "src/shims.d.ts"]
+  "include": ["src/client.tsx", "src/client-rows.tsx", "src/client-styles.ts"]
 }

@@ -1,7 +1,7 @@
 /**
  * dsh-plugin-simplemanager — 插件管家（client 面板）。
  * 注册进「设置」作为独立板块（slot: settings.section，id: simplemanager，导航名「桌面管家」）。
- * 面板内三栏：插件管理 / 插件热插拔（含可复制操作日志）/ 插件诊断（占位）。
+ * 面板内三栏：插件管理 / 插件热插拔（含可复制操作日志）/ 工具管理。
  * 布局：左侧文件夹列表（官方内置 / 第三方插件 / 自定义），右侧插件卡片网格；
  * 支持拖拽移动分类、内联编辑备注、一键启停、运行时热插拔 / 转正 / 真卸载，点击卡片展开查看依赖。
  */
@@ -14,7 +14,7 @@ export const name = 'dsh-plugin-simplemanager'
 export const inject = ['slots']
 
 /**
- * 本插件消费的 slots 服务最小类型面。官方真实类型是 `dsh-client-runtime` 的 `SlotRegistry`，
+ * 本插件消费的 slots 服务最小类型面。官方真实类型是 `dsh-client-ui-renderer` 的 `SlotRegistry`，
  * 但该包非本插件依赖、且经 `declare module` 扩展注入（独立工程内解析不到），故按实际调用结构性收窄。
  */
 type SlotsService = {
@@ -72,25 +72,6 @@ interface Browse {
   ok: boolean
   folders: Folder[]
   plugins: Plugin[]
-}
-
-// —— 第三板块「代码规范治理」诊断类型（镜像内核 diagnostics.ts）——
-type DiagLevel = 'ok' | 'warn' | 'err'
-interface DiagRule {
-  ruleId: number
-  title: string
-  level: DiagLevel
-  detail: string
-  evidence: Array<{ file: string; line: number; snippet: string }>
-  suggest: string
-}
-interface PluginDiagnostic {
-  name: string
-  pkgDir: string | null
-  scanned: number
-  runtime: { phase: string | null }
-  rules: DiagRule[]
-  summary: { ok: number; warn: number; err: number }
 }
 
 // —— 工具管理（第3栏）工具元数据：name + 启用态 + 描述 + 参数 schema（详情展开查看）——
@@ -207,22 +188,6 @@ async function browse(): Promise<Browse> {
   return await api<Browse>(`${API}/browse`)
 }
 
-/** client 无头冒烟预检：单步结果（load 注册 / apply 等），ok=false 的那步即重载崩溃根因。 */
-interface SmokeStepOutcome { name: string; ok: boolean; detail: string }
-/** 预检结局类别，reloadClient 按此分组渲染，避免把"必挂起"错标成"崩溃"（详见后端同类定义）。 */
-type SmokeOutcome = 'pending' | 'crash' | 'volatile' | 'warn' | 'pass'
-/** client 无头冒烟预检：单个插件的整体结论。ok = 能否安全 reload；outcome = 精确结局类别。 */
-interface ClientSmokeReport {
-  name: string
-  declared: boolean
-  ok: boolean
-  outcome: SmokeOutcome
-  steps: SmokeStepOutcome[]
-  error?: string
-  /** 非阻塞警告：重载会挂起等待的注入服务等。 */
-  warns?: string[]
-}
-
 /** 目录浏览层级（官方 directoryPicker.list 返回面）。 */
 interface DirLevel {
   path: string
@@ -240,6 +205,11 @@ async function listdir(path?: string): Promise<{ ok: boolean; level?: DirLevel; 
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ path }),
   })
+}
+
+/** 原生目录选择（官方 directoryPicker.pick → 宿主 OS 目录对话框，直接返回选中路径）。 */
+async function pickdir(): Promise<{ ok: boolean; path?: string | null; kind?: string; error?: string }> {
+  return await api(`${API}/pickdir`, { method: 'POST' })
 }
 
 export function apply(ctx: AppClientContext): void {
@@ -276,8 +246,8 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const [newName, setNewName] = useState('')
   const [tempInput, setTempInput] = useState('')
   const [tempBusy, setTempBusy] = useState(false)
-  /** 顶部导航：manage=插件管理 / hotswap=插件热插拔 / diagnose=插件诊断。 */
-  const [tab, setTab] = useState<'manage' | 'hotswap' | 'toolmanage' | 'diagnose'>('manage')
+  /** 顶部导航：manage=插件管理 / hotswap=插件热插拔 / toolmanage=工具管理。 */
+  const [tab, setTab] = useState<'manage' | 'hotswap' | 'toolmanage'>('manage')
   /** 操作日志条目（时间戳 + 级别 + 文本）：视图镜像持久 store，供热插拔栏查看与整段复制。 */
   const [logs, setLogs] = useState<LogEntry[]>(logStore.slice())
   /** 当前步骤骨架 + 实时状态（镜像 stepView）。 */
@@ -288,17 +258,12 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const [dirLevel, setDirLevel] = useState<DirLevel | null>(null)
   /** 目录选择弹窗是否打开（改造1：从内联改为独立弹层）。 */
   const [dirPickerOpen, setDirPickerOpen] = useState(false)
-  /** 重载前预检发现风险时的确认弹窗（report=展示文本，resolve=用户是否仍要重载）。 */
-  const [riskAsk, setRiskAsk] = useState<{ report: string; resolve: (v: boolean) => void } | null>(null)
   /** 插件搜索关键词（改造3：匹配重命名名 alias / 原名 name）。 */
   const [query, setQuery] = useState('')
   /** 当前拖拽悬停的落点 key（"folder:<id>" / "plugin:<name>"），用于落点高亮显示（改造2）。 */
   const [hoverTarget, setHoverTarget] = useState('')
   /** 当前拖拽悬停的落点相位（目标中点前/后），用于插入指示条（改造：拖拽排序放宽）。 */
   const [dropPhase, setDropPhase] = useState<'before' | 'after' | ''>('')
-  /** 第三板块：代码规范治理诊断结果（按插件聚合）。 */
-  const [diag, setDiag] = useState<PluginDiagnostic[]>([])
-  const [diagBusy, setDiagBusy] = useState(false)
   /** 工具管理（第3栏）：扫描分组结果 + 开关态 + 展开的插件卡牌/工具详情。 */
   // 工具管理统一视图：默认 listTools（未分组大聚合）与增强 scanToolGroups（归到插件/工具组卡）同为该结构。
   const [toolView, setToolView] = useState<ToolView | null>(null)
@@ -328,17 +293,6 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const [scanPickOpen, setScanPickOpen] = useState(false)
   /** 工具管理：扫描选卡面板中已勾选的插件包名集合。 */
   const [scanPickSel, setScanPickSel] = useState<Set<string>>(new Set())
-  // 诊断范围（多选文件夹，localStorage 持久化，避免每次手动勾选）。空数组 = 全部第三方。
-  const [diagFolders, setDiagFolders] = useState<string[]>(() => {
-    try {
-      const raw = localStorage.getItem('dsh-plugin-simplemanager:diagFolders')
-      if (raw) {
-        const arr = JSON.parse(raw)
-        if (Array.isArray(arr)) return arr.filter((x): x is string => typeof x === 'string')
-      }
-    } catch { /* 解析失败退回全量诊断 */ }
-    return []
-  })
   /** 统一确认弹窗（dsh 客户端风格卡片）：替代浏览器原生 confirm，支持可选「同时清除缓存」开关。 */
   const [ask, setAsk] = useState<AskReq | null>(null)
   const [askClearData, setAskClearData] = useState(false)
@@ -357,11 +311,6 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   useEffect(() => {
     void refresh()
   }, [refresh])
-
-  // 诊断范围选择持久化到 localStorage（跨重启保留，不用每次勾选）。
-  useEffect(() => {
-    try { localStorage.setItem('dsh-plugin-simplemanager:diagFolders', JSON.stringify(diagFolders)) } catch { /* ignore */ }
-  }, [diagFolders])
 
   // 订阅日志/步骤 store：任何写入触发组件重渲染（含组件重挂载时同步 latest）。
   useEffect(() => {
@@ -450,19 +399,6 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     document.body.removeChild(ta)
   }
 
-  /** 复制预检风险报告到剪贴板（复用日志兜底逻辑），组内做提示。 */
-  const copyRiskReport = (text: string): void => {
-    // 复制成功不弹顶部绿色提示，失败保留错误提示。
-    const done = (): void => { /* noop */ }
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        void navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done))
-        return
-      }
-    } catch { /* 走 fallback */ }
-    fallbackCopy(text, done)
-  }
-
   const clearLogs = (): void => {
     logStore.length = 0
     try { window.sessionStorage.removeItem(LOG_STORE_KEY) } catch { /* 忽略 */ }
@@ -470,75 +406,6 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     logSubscribe?.()
     setLogs([])
     setSteps(null)
-  }
-
-  /** 第三板块：一键体检——静态扫全部第三方已装插件副本库，按禁做清单逐条取证。只读。 */
-  const toggleDiagFolder = (id: string): void => {
-    setDiagFolders((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
-  }
-
-  const runDiagnostics = async (): Promise<void> => {
-    if (diagBusy) return
-    setDiagBusy(true)
-    pushLog('info', '开始代码规范体检（扫描所选文件夹内的第三方插件副本库）…')
-    try {
-      const r = await api<{ ok: boolean; report?: PluginDiagnostic[]; error?: string }>(`${API}/diagnostics`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ names: [], folders: diagFolders }),
-      })
-      if (!r.ok || !r.report) {
-        notify(r.error ?? '体检失败')
-        pushLog('err', `代码规范体检失败：${r.error ?? '未知原因'}`)
-        return
-      }
-      const report = Array.isArray(r.report) ? r.report : []
-      setDiag(report)
-      const err = report.flatMap((p) => p.rules ?? []).filter((x) => x.level === 'err').length
-      const warn = report.flatMap((p) => p.rules ?? []).filter((x) => x.level === 'warn').length
-      pushLog(err || warn ? 'warn' : 'ok', `体检完成：${report.length} 个插件 · 违规 ${err} 项 / 疑点 ${warn} 项`)
-    } catch (e) {
-      notify('体检请求失败')
-      pushLog('err', `代码规范体检请求异常：${String(e)}`)
-    } finally {
-      setDiagBusy(false)
-    }
-  }
-
-  /** 把诊断结果序列化为报告文本（供复制）。仅含非 ok 项，保留证据行号。 */
-  const formatDiagReport = (list: PluginDiagnostic[] = diag): string => {
-    if (list.length === 0) return '（尚未进行体检，或当前无诊断结果）'
-    const out: string[] = []
-    for (const p of list) {
-      const issues = (p.rules ?? []).filter((r) => r.level !== 'ok')
-      out.push(`## ${p.name}${p.pkgDir ? `\n副本：${p.pkgDir}` : ''}${p.runtime.phase === 'failed' ? '\n⚠ 运行态：failed（启动失败，需重装）' : ''}`)
-      if (issues.length === 0) {
-        out.push('✓ 全部规则通过')
-        continue
-      }
-      for (const r of issues) {
-        const mark = r.level === 'err' ? '✗ 违规' : '⚠ 疑点'
-        out.push(`- [${mark}] 规则${r.ruleId} ${r.title}`)
-        out.push(`  说明：${r.detail}`)
-        for (const ev of r.evidence) out.push(`  证据：${ev.file}${ev.line ? ':' + ev.line : ''} ${ev.snippet}`)
-        if (r.suggest) out.push(`  建议：${r.suggest}`)
-      }
-    }
-    return out.join('\n')
-  }
-
-  const copyDiagReport = (): void => {
-    if (diag.length === 0) return
-    const text = formatDiagReport()
-    // 复制成功不弹顶部绿色提示，失败保留错误提示。
-    const done = (): void => { /* noop */ }
-    try {
-      if (navigator.clipboard && window.isSecureContext) {
-        void navigator.clipboard.writeText(text).then(done).catch(() => fallbackCopy(text, done))
-        return
-      }
-    } catch { /* 走 fallback */ }
-    fallbackCopy(text, done)
   }
 
   /** 打开统一确认弹窗（dsh 客户端风格卡片），返回用户的选择。
@@ -1136,90 +1003,16 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     pollTimer = timer
   }
 
-  /** 重载 CLIENT 层前，对「活跃插件」做无头冒烟预检请求（kernel 进程判定 client 装配契约 + 注入服务门禁）。 */
-  const preflightClients = async (names: string[]): Promise<ClientSmokeReport[]> => {
-    try {
-      const r = await api<{ ok?: boolean; results: ClientSmokeReport[] }>(`${API}/verifyClient`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ names }),
-      })
-      return Array.isArray(r.results) ? r.results : []
-    } catch {
-      return []
-    }
-  }
-
-  /** 展开一条预检报告的有问题步骤明细（只列 ok=false 的步；其余通过步不再占行，避免噪音）。 */
-  const renderReportSteps = (r: ClientSmokeReport): string =>
-    (r.steps ?? []).filter((s) => !s.ok).map((s) => `   ✗ ${s.name}：${s.detail}`).join('\n')
-
-  /** 重载 CLIENT 层：先对活跃插件做无头冒烟预检，抓到「热注入没问题、但重载前端会崩」的插件就警告并列分步根因，
-   * 当前策略为「警告 + 仍允许重载」（硬阻止为未来方向）。静态存在性检查拦不住这类运行时错误，只能靠冒烟预检。 */
+  /** 重载 CLIENT 层：仅刷新渲染进程，不重启内核，会话与热装状态保留。
+   * 「插件能否干净启动」的统一判定已收敛为 pm_probe 真实探针（独立子进程实测），
+   * 不再做进程内无头冒烟预检（VM 3阀门引擎已因内核破坏性改动删除，见 git 历史）。 */
   const reloadClient = async (): Promise<void> => {
-    // 重载引导期会重新 apply 的插件都要预检：不仅 active，含引导中(pending/loading)与异常(failed)。
-    // 只预检 active 会漏掉「死在引导期、重载才崩」的高危插件（引擎独立重放 client，对非 active 不误报）。
-    // 排除 @deepseek-ai/* 官方核心：它们由壳以完整浏览器环境原生加载、重载必不崩，而 vm 冒烟沙箱
-    // 缺 URLSearchParams/provide 等环境会对其 apply 产生假阳性，故仅对第三方/自研插件做完整冒烟。
-    const preflightNames = plugins
-      .filter(
-        (p) =>
-          p.runtime != null &&
-          !p.name.startsWith('@deepseek-ai/') &&
-          ['active', 'pending', 'loading', 'failed'].includes(p.runtime),
-      )
-      .map((p) => p.name)
-    const base = '重载界面（仅刷新渲染进程，不重启内核）？\n当前会话与内核热装状态都会保留。'
-
-    if (preflightNames.length === 0) {
-      const { ok } = await askConfirm({ title: '重载界面', message: base, okText: '重载' })
-      if (!ok) return
-      window.location.reload()
-      return
-    }
-
-    pushLog('info', `—— 重载界面前：${preflightNames.length} 个待重载插件 client 无头冒烟预检开始（装配契约 + 真实 cordis 门禁）——`)
-    const reports = await preflightClients(preflightNames)
-    // 用 outcome 精确分级，而非把 ok 当"崩溃"二值：
-    //   阻断(pending/crash)：重载必失败——fixture 的"必挂起"与"真实崩溃"同级，都是重载进不去/白屏。
-    //   关注(volatile/warn)：可重载但应知晓——缺 client 产物、门禁近似判定的未知服务名等。
-    //   pass：安全。
-    const blockers = reports.filter((r) => r.declared && (r.outcome === 'pending' || r.outcome === 'crash'))
-    const concernees = reports.filter((r) => r.declared && (r.outcome === 'volatile' || r.outcome === 'warn'))
-
-    if (blockers.length === 0 && concernees.length === 0) {
-      pushLog('ok', `预检通过：${reports.length} 个待重载插件均无重载失败风险`)
-      const { ok } = await askConfirm({ title: '重载界面', message: `${base}\n预检 ${reports.length} 个待重载插件，均无重载失败风险。`, okText: '重载' })
-      if (!ok) return
-      window.location.reload()
-      return
-    }
-
-    const blockerDetail = blockers
-      .map((r) => {
-        const tag = r.outcome === 'pending' ? '必挂起' : r.outcome === 'crash' ? '真实崩溃' : '异常'
-        return `· ${r.name}（${tag}）\n${renderReportSteps(r)}${r.error ? `\n   根因：${r.error}` : ''}`
-      })
-      .join('\n')
-    const concernDetail = concernees
-      .map((r) => `· ${r.name}\n${renderReportSteps(r)}\n${(r.warns ?? []).map((w) => `   ⚠ ${w}`).join('\n')}`)
-      .join('\n')
-    const msgParts: string[] = []
-    if (blockers.length > 0) {
-      msgParts.push(`· ${blockers.length} 个插件的 client 重载**将失败**（必挂起或真实崩溃，整页被门禁打回或白屏）：\n${blockerDetail}`)
-      pushLog('warn', `预检发现 ${blockers.length} 个插件重载将失败（${blockers.map((b) => b.name).join('、')}）`)
-    }
-    if (concernees.length > 0) {
-      msgParts.push(`· ${concernees.length} 个插件重载时可继续，但需关注（缺 client 产物或存在潜在缺陷）：\n${concernDetail}`)
-      pushLog('warn', `${concernees.length} 个插件重载需关注（${concernees.map((c) => c.name).join('、')}）`)
-    }
-    const warnMsg = `重载界面预检报告：\n\n${msgParts.join('\n\n')}`
-    // 应用内弹窗确认（而非 window.confirm）：提供「复制报告」一键拷贝，便于去插件处定位修改。
-    // 与旧版一致：默认警示但允许继续重载。
-    const proceed = await new Promise<boolean>((resolve) => setRiskAsk({ report: warnMsg, resolve }))
-    if (!proceed) return
-    pushLog('info', '用户选择继续：仍按原样重载界面')
-    window.location.reload()
+    const { ok } = await askConfirm({
+      title: '重载界面',
+      message: '重载界面（仅刷新渲染进程，不重启内核）？\n当前会话与内核热装状态都会保留。',
+      okText: '重载',
+    })
+    if (ok) window.location.reload()
   }
 
   const openBrowser = async (path?: string): Promise<void> => {
@@ -1232,10 +1025,24 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     setDirLevel(r.level)
   }
 
-  // 开启应用内目录浏览（进入 home 层），以独立弹窗展示。
+  // 开启目录选择：优先应用内浏览（browse 后端，弹窗逐层走目录）；
+  // 若宿主仅支持原生选择（native 后端，如本机 Windows alpha.1 → pick OS 目录对话框），
+  // 自动回退到原生选择器，把选中的目录直接填进输入框。
   const startTempBrowse = async (): Promise<void> => {
-    setDirPickerOpen(true)
-    await openBrowser(undefined)
+    const browse = await listdir(undefined)
+    if (browse.ok && browse.level) {
+      setDirPickerOpen(true)
+      setBrowsePath(browse.level.path)
+      setDirLevel(browse.level)
+      return
+    }
+    const picked = await pickdir()
+    if (picked.ok && picked.path) {
+      setTempInput(picked.path)
+      notify(`已选择目录：${picked.path}`)
+    } else {
+      notify(picked.error ?? '当前环境不支持应用内目录浏览，且无可用的原生目录选择')
+    }
   }
 
   const closeDirPicker = (): void => {
@@ -1418,7 +1225,6 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
               ['manage', '插件管理'],
               ['hotswap', '插件热插拔'],
               ['toolmanage', '工具管理'],
-              ['diagnose', '插件诊断'],
             ] as const
           ).map(([key, label]) => (
           <button
@@ -1429,7 +1235,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
             {label}
           </button>
         ))}
-        <button style={s.tabClear} title="清空插件诊断/热插拔操作日志" onClick={() => { if (logs.length === 0) return; clearLogs() }}>{'⧉ 清空日志'}</button>
+        <button style={s.tabClear} title="清空热插拔操作日志" onClick={() => { if (logs.length === 0) return; clearLogs() }}>{'⧉ 清空日志'}</button>
       </div>
       </div>
 
@@ -1778,103 +1584,6 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
         </div>
       )}
 
-      {tab === 'diagnose' && (
-        <div style={s.diagnosePanel}>
-          <div style={s.diagHead}>
-            <div style={s.diagHeadText}>
-              <span style={s.diagnoseTitle}>{'代码规范治理'}</span>
-              <span style={s.diagHint}>{'只读扫描已装第三方插件的编译产物（副本库），按《DSH 插件开发质量禁做清单》8 条逐项取证；不改任何源码与装配层。'}</span>
-            </div>
-            <button style={s.diagRunBtn} onClick={() => void runDiagnostics()} disabled={diagBusy}>
-              {diagBusy ? '体检中…' : '⛁ 一键体检'}
-            </button>
-          </div>
-
-          <div style={s.diagFolderBar}>
-            <span style={s.diagFolderLabel}>{'诊断范围'}</span>
-            <label style={s.diagChip}>
-              <input
-                type="checkbox"
-                checked={diagFolders.length === 0}
-                onChange={() => setDiagFolders([])}
-                style={s.checkbox}
-              />
-              <span>{'全部第三方'}</span>
-            </label>
-            {folders.map((f) => (
-              <label key={f.id} style={s.diagChip}>
-                <input
-                  type="checkbox"
-                  checked={diagFolders.includes(f.id)}
-                  onChange={() => toggleDiagFolder(f.id)}
-                  style={s.checkbox}
-                />
-                <span>{f.name}</span>
-              </label>
-            ))}
-          </div>
-
-          {diag.length === 0 ? (
-            <div style={s.diagnoseEmpty}>{'尚未体检。点击「一键体检」扫描全部第三方插件副本库，这里会按插件展示治理卡：✗ 违规 / ⚠ 疑点 均带证据行号与整改建议。'}</div>
-          ) : (
-            <div style={s.diagSummaryBar}>
-              <span style={s.diagSummaryText}>{`共体检 ${diag.length} 个插件`}</span>
-              <span style={s.diagSummaryEll}>
-                <span style={{ color: 'var(--dsw-color-error, #e74c3c)' }}>{`✗ 违规 ${diag.flatMap((p) => p.rules ?? []).filter((r) => r.level === 'err').length}`}</span>
-                <span style={{ color: 'var(--dsw-color-warning, #f39c12)' }}>{`⚠ 疑点 ${diag.flatMap((p) => p.rules ?? []).filter((r) => r.level === 'warn').length}`}</span>
-                <span style={{ color: 'var(--dsw-color-success, #27ae60)' }}>{`✓ 通过 ${diag.flatMap((p) => p.rules ?? []).filter((r) => r.level === 'ok').length}`}</span>
-              </span>
-              <button style={s.ghostBtnSm} onClick={copyDiagReport} title="复制全部非通过项的治理报告到剪贴板">{'⧉ 复制报告'}</button>
-            </div>
-          )}
-
-          <div style={s.diagList}>
-            {diag.map((p) => {
-              const issues = (p.rules ?? []).filter((r) => r.level !== 'ok')
-              const err = (p.rules ?? []).filter((r) => r.level === 'err').length
-              const warn = (p.rules ?? []).filter((r) => r.level === 'warn').length
-              const face = err > 0 ? 'err' : warn > 0 ? 'warn' : 'ok'
-              const faceColor = face === 'err' ? 'var(--dsw-color-error, #e74c3c)' : face === 'warn' ? 'var(--dsw-color-warning, #f39c12)' : 'var(--dsw-color-success, #27ae60)'
-              return (
-                <div key={p.name} style={{ ...s.diagCard, borderLeft: `3px solid ${faceColor}` }}>
-                  <div style={s.diagCardHead}>
-                    <span style={s.diagCardName}>{p.name}</span>
-                    <span style={{ ...s.diagCardBadge, color: faceColor }}>{face === 'ok' ? '✓ 通过' : face === 'warn' ? '⚠ 有疑点' : '✗ 有违规'}</span>
-                    {p.runtime.phase === 'failed' && <span style={{ ...s.diagCardBadge, color: 'var(--dsw-color-error, #e74c3c)' }}>{'半挂(failed)'}</span>}
-                    <span style={s.diagCardMeta}>{`${p.scanned} 个文件 · 规则 ${p.rules.length} 条`}</span>
-                  </div>
-                  <div style={s.diagRuleList}>
-                    {issues.length === 0 ? (
-                      <span style={s.diagRuleDetail}>{'全部规则通过'}</span>
-                    ) : (
-                      issues.map((r) => (
-                        <div key={r.ruleId} style={s.diagRuleRow}>
-                          <span style={{ ...s.diagRuleMark, color: r.level === 'err' ? 'var(--dsw-color-error, #e74c3c)' : 'var(--dsw-color-warning, #f39c12)' }}>
-                            {r.level === 'err' ? '✗' : '⚠'}
-                          </span>
-                          <div style={{ flex: 1, minWidth: 0 }}>
-                            <div style={s.diagRuleTitle}>{`规则${r.ruleId} · ${r.title}`}</div>
-                            <div style={s.diagRuleDetail}>{r.detail}</div>
-                            {r.suggest && <div style={{ ...s.diagRuleDetail, color: 'var(--dsw-alias-label-tertiary)' }}>{`建议：${r.suggest}`}</div>}
-                            {r.evidence.map((ev, i) => (
-                              <div key={i} style={s.diagEvid} title={ev.snippet}>{
-                                ev.line
-                                  ? `📄 ${ev.file}:${ev.line}  ${ev.snippet}`
-                                  : `📄 ${ev.snippet}`
-                              }</div>
-                            ))}
-                          </div>
-                        </div>
-                      ))
-                    )}
-                  </div>
-                </div>
-              )
-            })}
-          </div>
-        </div>
-      )}
-
       {dirPickerOpen && (
         <div style={s.modalMask} onClick={closeDirPicker}>
           <div style={s.modalPanel} onClick={(e) => e.stopPropagation()}>
@@ -1931,38 +1640,6 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
             >
               {dirLevel?.roots ? '加载当前目录' : `加载当前目录：${browsePath ?? '（尚未选择）'}`}
             </button>
-          </div>
-        </div>
-      )}
-      {riskAsk && (
-        <div style={s.modalMask} onClick={() => { riskAsk.resolve(false); setRiskAsk(null) }}>
-          <div style={{ ...s.modalPanel, maxWidth: 600 }} onClick={(e) => e.stopPropagation()}>
-            <div style={s.modalHead}>
-              <span style={s.modalTitle}>{'⚠ 重载前预检发现风险'}</span>
-              <button style={s.iconBtnSm} title="取消（不重载）" onClick={() => { riskAsk.resolve(false); setRiskAsk(null) }}>{'✕'}</button>
-            </div>
-            <div
-              style={{
-                fontSize: 12,
-                margin: '12px 0',
-                padding: 10,
-                borderRadius: 6,
-                background: 'var(--dsw-alias-bg-mask)',
-                color: 'var(--dsw-alias-label-secondary)',
-                whiteSpace: 'pre-wrap',
-                lineHeight: 1.6,
-                maxHeight: 240,
-                overflow: 'auto',
-              }}
-            >
-              {riskAsk.report}
-            </div>
-            <div style={s.tempRow}>
-              <button style={s.ghostBtn} onClick={() => copyRiskReport(riskAsk.report)} title="复制完整预检报告到剪贴板，方便去插件处定位修改">{'⧉ 复制报告'}</button>
-              <div style={{ flex: 1 }} />
-              <button style={s.ghostBtn} onClick={() => { riskAsk.resolve(false); setRiskAsk(null) }}>{'取消'}</button>
-              <button style={s.primaryBtn} onClick={() => { riskAsk.resolve(true); setRiskAsk(null) }} title="仍按原样刷新渲染进程，可先复制报告去修复">{'仍要重载'}</button>
-            </div>
           </div>
         </div>
       )}

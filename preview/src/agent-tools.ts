@@ -59,15 +59,6 @@ export type OpResult = {
   hint?: string
 }
 
-/** 预检（verifyPreflight，基础三态门禁）的结果，含失败步骤明细。 */
-export type PreflightDTO = {
-  name: string
-  ok: boolean
-  outcome: string
-  steps: { name: string; ok: boolean; detail: string }[]
-  error?: string
-}
-
 /** 触发「刷新渲染进程」（reloadClient）的结果：仅登记信号，零检测、零阻塞。 */
 export type ReloadClientDTO = {
   ok: boolean
@@ -75,10 +66,16 @@ export type ReloadClientDTO = {
   note: string
 }
 
-/** L0 真实探针（pm_probe）的结果：外置隔离实例的三态判定 + 逐步报告 + 归因。 */
+/** L0 真实探针（pm_probe）的结果：外置隔离实例的三态判定 + 逐步报告 + 归因。
+ * 单候选与批量共存（specs）共用此形态：批量时 plugins 为共存名单、name 省略。 */
 export type ProbeDTO = {
   ok: boolean
-  name: string
+  /** 单候选探针时的包名（批量时省略，用 plugins 名单）。 */
+  name?: string
+  /** 共存于本隔离实例的候选插件名单。 */
+  plugins: string[]
+  /** 批量探针标记（specs 传入时置 probe-batch）。 */
+  action?: 'probe-batch'
   outcome: 'pass' | 'crash' | 'hang' | 'render-crash' | 'error'
   rendered: boolean
   /** 崩溃/挂起时从启动日志定位到的候选插件。 */
@@ -87,6 +84,14 @@ export type ProbeDTO = {
   summary?: string
   error?: string
   elapsedMs: number
+  /** 批量探针：解析失败的候选（附原因），不影响其余候选共存探测。 */
+  unresolved?: Array<{ spec: string; name?: string; reason: string }>
+  /** keep 模式：判定通过后保留隔离实例与副本（keptUrl 供浏览器人工检查）。 */
+  kept?: boolean
+  keptPid?: number
+  keptPort?: number
+  keptUrl?: string
+  keptDir?: string
 }
 
 /** 执行器接口：index.ts 的 makeAgentOps 闭包实现，供本文件的 defineTool 薄装配。 */
@@ -96,9 +101,9 @@ export type AgentOps = {
   tempRemove(name: string): Promise<OpResult>
   promote(name: string): Promise<OpResult>
   uninstall(name: string, clearData?: boolean): Promise<OpResult>
-  verifyPreflight(specs: string[]): Promise<PreflightDTO[]>
   reloadClient(): ReloadClientDTO
-  probe(name: string): Promise<ProbeDTO>
+  probe(name: string | undefined, keep: boolean, spec?: string): Promise<ProbeDTO>
+  probeMany(specs: string[], keep: boolean): Promise<ProbeDTO>
 }
 
 // —— tool 参数/输出 schema（dsh schema DSL，auto-flow 进 agent system prompt）——
@@ -106,9 +111,6 @@ export type AgentOps = {
 /* 字面量 schema 需 as const 保持 type 判别式（string/boolean/array/json）不被拓宽，否则失配 ValueSchemaSpec。 */
 const PARAM_NAMES = { name: { type: 'string', required: true, description: '插件包名（用返回的 packageName，同名热装可能带 -hotN，勿用路径/原名）' } } as const
 const PARAM_SPEC = { spec: { type: 'string', required: true, description: '插件源，三种形态任选：① registry 包名，如 foo 或 foo@1.2.0；② 本地插件目录路径（绝对或相对，如 D:/AI/dsh-coder/dsh-plugins/spectree/dsh-v0.1.1-rc.2 或 ./plugin）；③ 显式 file:/link: 前缀路径。要求目标是一个可解析插件包：目录/registry 包含 package.json（有规范 name + 可加载 main/exports 入口），且本地路径须为纯 ASCII（含中文/日文路径会被 pnpm 截断安装失败）' } } as const
-const PARAM_SPECS_ARR = {
-  specs: { type: 'array', required: true, items: { type: 'string' } as const, description: '要预检的插件源列表：传包名、本地路径或 file: 均可（会先解析成包名再门禁预检）' },
-} as const
 const PARAM_OP = {
   name: { type: 'string', required: true, description: '插件包名（用 package.json 的 name，见 pm_tempLoad 返回的 packageName），不会用入参路径' },
   clearData: { type: 'boolean', description: '卸载时是否同时清除该插件的自持数据（默认 false）' },
@@ -216,17 +218,6 @@ export function registerAgentTools(ctx: Context, ops: AgentOps): (() => void)[] 
 
   reg(
     defineTool({
-      name: 'pm_verifyPreflight',
-      description:
-        '热装前必做的第 0 步预检：判定注入服务可达、装配/重载是否挂起。specs 传包名/路径/file:。outcome 非 pass 时先修再 pm_tempLoad。',
-      parameters: { ...PARAM_SPECS_ARR },
-      output: { schema: OUT_SCHEMA, render: (_a, v) => text(v) },
-      execute: (args, _exec) => ops.verifyPreflight(args.specs),
-    }),
-  )
-
-  reg(
-    defineTool({
       name: 'pm_reloadClient',
       description:
         '触发前端渲染进程刷新（重载界面）。仅刷渲染进程不重启内核，会话与热装状态保留。零检测零阻塞。带前端板块的插件改动需用户在面板肉眼可见时再调。',
@@ -240,10 +231,18 @@ export function registerAgentTools(ctx: Context, ops: AgentOps): (() => void)[] 
     defineTool({
       name: 'pm_probe',
       description:
-        'L0 真实探针：对外置隔离实例实测某插件能否干净启动（HTTP+渲染三态判定，崩溃/挂起自动隔离并回滚副本，真实 profile 只读不改）。输入插件包名。result 非 pass 且归因该插件时，建议禁用后再处理。注意：首次调用会真实 spawn 一条独立 dsh 子进程并 pnpm 装配隔离副本，耗时可达分钟级。',
-      parameters: { ...PARAM_NAMES },
+        'L0 真实探针：对外置隔离实例实测插件能否干净启动（HTTP+渲染三态判定，崩溃/挂起自动隔离并回滚副本，真实 profile 只读不改）。候选源传 spec（本地路径/file:/包名）即可直接探针，不依赖 pm_tempLoad；也可只传包名（回落已热装 temp 源 / profile node_modules）。传 specs 数组则批量：全部候选共存于同一个隔离实例（一次装配/一个内核/一个 URL），返回单份报告 + plugins 名单 + unresolved 列表。隔离 home 携带真实 settings/credentials 快照。keep=true 时判定通过后不清理，保留隔离实例供浏览器直接打开人工检查（返回 keptUrl/keptPid/keptDir）。result 非 pass 且归因某插件时，建议禁用后再处理。注意：调用会真实 spawn 独立 dsh 子进程并 pnpm 装配隔离副本，耗时可达分钟级。',
+      parameters: {
+        name: { type: 'string', description: '插件包名；传 spec/specs 时可省略（自动从 spec 解析）' },
+        spec: { type: 'string', description: '单个候选插件源（本地路径/file:/registry 包名），与 pm_tempLoad 的 spec 同形；传了则以它为探针候选' },
+        specs: { type: 'array', items: { type: 'string' } as const, description: '批量候选源列表（本地路径/file:/包名）；非空时全部候选共存于同一个隔离实例，忽略 name/spec' },
+        keep: { type: 'boolean', description: '判定通过后保留隔离实例与副本不清理：keptUrl 可直接在浏览器打开人工检查，keptPid/keptDir 供事后关闭回收；默认 false 即判即清' },
+      } as const,
       output: { schema: OUT_SCHEMA, render: (_a, v) => text(v) },
-      execute: (args, _exec) => ops.probe(args.name),
+      execute: (args, _exec) =>
+        Array.isArray(args.specs) && args.specs.length > 0
+          ? ops.probeMany(args.specs, args.keep === true)
+          : ops.probe(args.name, args.keep === true, args.spec),
     }),
   )
 

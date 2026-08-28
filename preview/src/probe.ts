@@ -14,7 +14,7 @@
  *   - 独立状态根 + 独立端口/环境(DSH_HOME override)，不与运行中桌面内核冲突；
  *   - 结束必杀进程树(taskkill /T /F) + 删副本，保证零残留。
  */
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, lstatSync, readlinkSync, createWriteStream } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, lstatSync, readlinkSync, createWriteStream } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { createServer } from 'node:net'
@@ -224,40 +224,73 @@ function sha256File(path: string): string {
 // 隔离副本构造（环境纪律核心：绝不复制真实 profile 的 node_modules）
 // ---------------------------------------------------------------------------
 
+/** 探针候选名单项：批量探针时全部候选共存于同一个隔离实例。 */
+export interface ProbeCandidate {
+  /** 插件真实包名（从 spec 解析）。 */
+  name: string
+  /** 插件源目录（file: 装配指向）。 */
+  dir: string
+}
+
 export interface IsolatedProfileSpec {
   /** 隔离副本目录（探针自已建，测完销毁）。 */
   dir: string
-  /** 候选插件以其源目录装配（copyDeps=false 时仅声明，不放 node_modules 副本）。 */
-  candidate: string
-  candidateSpec: string
+  /** 副本内 profile 目录（home/profiles/web，pnpm 装配与实例 cwd 均在此）。 */
+  profileDir: string
+  /** 副本内隔离 home 根（实例 DSH_HOME 指向此处，profiles 解析彻底离开真实 home）。 */
+  homeDir: string
+  /** 本次共存装配的候选名单（file: 指向各自源目录）。 */
+  candidates: ProbeCandidate[]
   logDir: string
 }
 
 /** 从真实 profile 的装配元数据派生隔离副本：copy 依赖清单/补丁，不 copy node_modules。
- * 返回 { dir, candidate, candidateSpec, logDir }；任何失败抛 Error。 */
+ * `candidates` 为批量候选名单——全部共存于同一个隔离实例（一次装配/一个内核/一个 URL），
+ * 探测插件间真实共存效果。`companions` 为「当前环境其余已加载第三方插件」（name → 装配 spec），
+ * 与候选一起放进副本，实现全量协同探测。返回 { dir, profileDir, homeDir, candidates, logDir }；任何失败抛 Error。 */
 export function makeIsolatedProfile(
   baseProfileDir: string,
   stateRoot: string,
-  candidate: string,
-  candidateSpec: string,
+  candidates: ProbeCandidate[],
+  companions?: Array<{ name: string; spec: string }>,
 ): IsolatedProfileSpec {
   const probeRoot = join(stateRoot, 'probe')
   mkdirSync(probeRoot, { recursive: true })
   const stamp = `${Date.now()}-${Math.floor(Math.random() * 1e6)}`
   const dir = join(probeRoot, `op-${stamp}`)
   const logDir = join(probeRoot, `logs-${stamp}`)
-  mkdirSync(dir, { recursive: true })
+  // 隔离 home：实例的 DSH_HOME 指向 op/home（profile 名固定 web，`dsh web` 即 --profile web）。
+  // 此前不设隔离 home 时子进程继承父内核 DSH_HOME，`dsh web` 实际服务真实 profiles/web，
+  // 候选从未被装配加载（实测「探针 pass 但浏览器里没有插件」的根因）。
+  const homeDir = join(dir, 'home')
+  const profileDir = join(homeDir, 'profiles', 'web')
+  mkdirSync(profileDir, { recursive: true })
   mkdirSync(logDir, { recursive: true })
 
-  // 装配元数据：锁定同源官方依赖 + 候选插件(以 file: 指向其源，非 link:，内存判据)。
+  // 装配元数据：锁定同源官方依赖 + 全部候选插件(以 file: 指向其源，非 link:，内存判据)。
   const basePkg = JSON.parse(readFileSync(join(baseProfileDir, 'package.json'), 'utf8')) as {
     dependencies?: Record<string, string>
     lockfileVersion?: unknown
     dsh?: unknown
   }
   const deps: Record<string, string> = { ...(basePkg.dependencies ?? {}) }
-  delete deps[candidate]
-  deps[candidate] = `file:${candidateSpec}`
+  const candidateList = (Array.isArray(candidates) ? candidates : []).filter(
+    (c) => c && typeof c.name === 'string' && typeof c.dir === 'string',
+  )
+  const candidateNames = new Set(candidateList.map((c) => c.name))
+  for (const c of candidateList) {
+    delete deps[c.name]
+    deps[c.name] = `file:${c.dir}`
+  }
+  // 全量协同：把当前环境其余已加载第三方插件一并放进副本。
+  // 已声明在 profile 的项（含原 link:）原样携带；漏声明（临时加载/热装副本）由 companions 补装。
+  if (companions) {
+    for (const c of companions) {
+      if (!c || !c.name || !c.spec) continue
+      if (deps[c.name] !== undefined || candidateNames.has(c.name)) continue
+      deps[c.name] = c.spec
+    }
+  }
   const probePkg: Record<string, unknown> = {
     name: 'dsh-simplemanager-probe',
     private: true,
@@ -265,15 +298,78 @@ export function makeIsolatedProfile(
     dependencies: deps,
   }
   if (basePkg.dsh) probePkg.dsh = basePkg.dsh
-  writeFileSync(join(dir, 'package.json'), `${JSON.stringify(probePkg, null, 2)}\n`, 'utf8')
+  // 装配登记：候选/伴随插件此前只进 dependencies、不进任何装配层，实例从不加载它们。
+  // 声明了 dsh.bundle.patch 的包走 bundle 层（与 simplemanager 自身在主 profile 的装配方式同构）；
+  // 普通插件包走用户 patch 的 `- insert:` 行（与 pm_promote 落盘格式同构）。
+  const profileManifest = (probePkg.dsh && typeof probePkg.dsh === 'object' ? (probePkg.dsh as { profile?: Record<string, unknown> }).profile : undefined) ?? {}
+  const baseBundles = Array.isArray(profileManifest.bundles) ? [...(profileManifest.bundles as string[])] : []
+  const bundleAdds: string[] = []
+  const insertAdds: Array<{ id: string; name: string }> = []
+  const declare = (name?: string) => {
+    const spec = name ? deps[name] : undefined
+    if (typeof spec !== 'string' || spec === '') return
+    if (baseBundles.includes(name!) || bundleAdds.includes(name!)) return
+    let meta: { name?: string; dsh?: { bundle?: { patch?: string } } } = {}
+    try {
+      meta = JSON.parse(readFileSync(join(spec.replace(/^(file|link):/, ''), 'package.json'), 'utf8'))
+    } catch { /* 清单不可读则按普通插件处理 */ }
+    if (meta && meta.dsh && meta.dsh.bundle && meta.dsh.bundle.patch) bundleAdds.push(name!)
+    else insertAdds.push({ id: typeof meta?.name === 'string' ? meta.name : name!, name: name! })
+  }
+  for (const c of candidateList) declare(c.name)
+  for (const c of companions ?? []) declare(c?.name)
+  if (bundleAdds.length > 0)
+    probePkg.dsh = { ...(probePkg.dsh as Record<string, unknown> ?? {}), profile: { ...profileManifest, bundles: [...baseBundles, ...bundleAdds] } }
+  writeFileSync(join(profileDir, 'package.json'), `${JSON.stringify(probePkg, null, 2)}\n`, 'utf8')
+  // 副本自洽 workspace 根：本目录放空 packages，pnpm 停在副本，不再上溯到祖先 workspace
+  // （如 home 残留的 pnpm-workspace.yaml，会把依赖误判装进祖先项目而非隔离副本）。
+  writeFileSync(join(profileDir, 'pnpm-workspace.yaml'), 'packages: []\n', 'utf8')
+  // 官方 peer 由内核运行时提供、公共 registry 拉不到（如 @deepseek-ai/dsh-* @0.1.2-alpha.x 发行内嵌）：
+  // 关闭 auto-install-peers，装配阶段不把候选/伴随插件的官方 peer 当真依赖去 npm 拉（会 NO_MATCHING_VERSION），
+  // 运行时由探针实例的 DSH 内核按 peer 提供者解析——即 tempLoad「skipOfficialPeers」在隔离装配里的等价物。
+  writeFileSync(join(profileDir, '.npmrc'), 'auto-install-peers=false\nstrict-peer-dependencies=false\n', 'utf8')
 
-  // 补丁：完整复制真实补丁，确证候选能否在真实装配语义下装载（不 copy node_modules 是唯一的取舍）。
+  // 补丁：完整复制真实补丁，确证候选能否在真实装配语义下装载（不 copy node_modules 是唯一的取舍）；
+  // 普通插件包没有 bundle patch 可声明，追加 `- insert:` 行补登记（格式与官方装配器一致）。
+  let patchText = ''
   try {
-    const patch = readFileSync(join(baseProfileDir, 'cordis.patch.yml'), 'utf8')
-    writeFileSync(join(dir, 'cordis.patch.yml'), patch, 'utf8')
-  } catch { /* 无补丁则跳过 */ }
+    patchText = readFileSync(join(baseProfileDir, 'cordis.patch.yml'), 'utf8')
+  } catch { patchText = '# (probe: no base patch)\n' }
+  // bundle 化条目去重：被加进副本 bundles 的包，若已转正过（复制来的 patch 里有其 insert 行），
+  // 会 bundle+patch 双重登记 → duplicate loader entry id。对齐 reconcilePatchResidual 语义：
+  // bundle 化条目从 patch 层剥离（只剥「- id: 后紧跟 name:」的稳定两项格式，其余行不动）。
+  if (bundleAdds.length > 0) {
+    const bundleSet = new Set(bundleAdds)
+    const lines = patchText.split(/\r?\n/)
+    const kept: string[] = []
+    for (let i = 0; i < lines.length; i++) {
+      const nm = i + 1 < lines.length ? lines[i + 1].match(/^\s+name:\s*(.*?)\s*$/) : null
+      if (/^\s*-\s+id:\s*/.test(lines[i]) && nm && bundleSet.has(nm[1].replace(/^["']|["']$/g, ''))) {
+        i++
+        continue
+      }
+      kept.push(lines[i])
+    }
+    patchText = kept.join('\n')
+  }
+  if (insertAdds.length > 0) {
+    const block = insertAdds.map((e) => `    - id: ${e.id}\n      name: ${e.name}`).join('\n')
+    if (/\[\]\s*$/.test(patchText)) patchText = patchText.replace(/\[\]\s*$/, `- insert:\n${block}\n`)
+    else patchText = patchText.replace(/\s*$/, `\n- insert:\n${block}\n`)
+  }
+  writeFileSync(join(profileDir, 'cordis.patch.yml'), patchText, 'utf8')
 
-  return { dir, candidate, candidateSpec, logDir }
+  // 配置快照：把真实 home 的 settings.yaml、.credentials.yaml 一次性只读拷进隔离 home，
+  // 候选插件前端（供应商管理/模型选择等）即能看到真实配置与密钥。只复制不链接：隔离实例的
+  // 一切写入都落在副本，真实 home 全程零接触。storages/会话不携带（工作区与会话身份留在真实实例）。
+  const homeRoot = dirname(dirname(baseProfileDir)) // <home>/profiles/web → <home>
+  for (const f of ['settings.yaml', '.credentials.yaml']) {
+    try {
+      if (existsSync(join(homeRoot, f))) copyFileSync(join(homeRoot, f), join(homeDir, f))
+    } catch { /* 单个文件失败不阻断探针 */ }
+  }
+
+  return { dir, profileDir, homeDir, candidates: candidateList, logDir }
 }
 
 // ---------------------------------------------------------------------------
@@ -281,15 +377,22 @@ export function makeIsolatedProfile(
 // ---------------------------------------------------------------------------
 
 export interface ProbeOptions {
-  candidate: string
+  /** 批量候选名单：全部共存于同一个隔离实例（一次装配/一个内核/一个 URL）；优先于 candidate/candidateDir。 */
+  candidates?: ProbeCandidate[]
+  /** 单元候选（candidates 缺省时的兼容形态）。 */
+  candidate?: string
   /** 候选插件源目录(用于 file: 装配与归因)。 */
-  candidateDir: string
+  candidateDir?: string
   /** 真实 profile 目录（派生装配元数据 + 归因 patch 行）。 */
   profileDir: string
   /** 插件管家状态根，用于承载隔离副本与日志。 */
   stateRoot: string
+  /** 全量协同：当前环境其余已加载第三方插件（name→装配 spec），与候选一起装入隔离副本。 */
+  companions?: Array<{ name: string; spec: string }>
   /** DSH_HOME override（隔离状态根）；缺省继承当前环境。 */
   dshHome?: string
+  /** keep 模式：判定通过后保留隔离实例与副本，供人工浏览器检查（不清理）。 */
+  keep?: boolean
   port?: number
   firstWaitSec?: number
   renderSettleSec?: number
@@ -308,14 +411,20 @@ export interface ProbeReport {
   bootLogTail: string
   elapsedMs: number
   steps: string[]
+  /** keep 模式：判定通过后保留隔离实例与副本（默认测完即清、零残留）。 */
+  kept?: boolean
+  keptPid?: number
+  keptPort?: number
+  keptUrl?: string
+  keptDir?: string
 }
 
 let _probeSeq = 0
 
-function spawnDetached(cmdLine: string[], cwd: string, outLog: string, errLog: string): ChildProcess {
+function spawnDetached(cmdLine: string[], cwd: string, outLog: string, errLog: string, env?: NodeJS.ProcessEnv): ChildProcess {
   const child = isWin()
-    ? spawn('cmd.exe', ['/d', '/s', '/c', cmdLine.join(' ')], { cwd, stdio: [ 'ignore', 'pipe', 'pipe' ] })
-    : spawn(cmdLine[0], cmdLine.slice(1), { cwd, stdio: [ 'ignore', 'pipe', 'pipe' ] })
+    ? spawn('cmd.exe', ['/d', '/s', '/c', cmdLine.join(' ')], { cwd, stdio: [ 'ignore', 'pipe', 'pipe' ], env: env ?? process.env })
+    : spawn(cmdLine[0], cmdLine.slice(1), { cwd, stdio: [ 'ignore', 'pipe', 'pipe' ], env: env ?? process.env })
   const so = createWriteStream(outLog, { flags: 'a' })
   const se = createWriteStream(errLog, { flags: 'a' })
   if (child.stdout) child.stdout.pipe(so)
@@ -396,12 +505,18 @@ export interface RunProbeResult extends ProbeReport {
   pnpmLog?: string
 }
 
-/** 执行一次 L0 探针：造隔离副本 → 干净装配候选 → spawn 外置独立实例 → 三态 + 渲染心跳 → 归因 → 必清残留。 */
+/** 执行一次 L0 探针：造隔离副本 → 干净装配全部候选（共存一实例） → spawn 外置独立实例 → 三态 + 渲染心跳 → 归因 → 必清残留。 */
 export async function runProbe(opts: ProbeOptions): Promise<RunProbeResult> {
   const t0 = Date.now()
   const port = opts.port ?? (await resolveFreePort())
   const firstWaitSec = opts.firstWaitSec ?? 60
   const renderSettleSec = opts.renderSettleSec ?? 20
+  // keep 模式：判定通过后保留隔离实例与副本，供人工在浏览器打开检查（keptUrl/keptPid/keptDir 回传）。
+  const keep = opts.keep === true
+  // 批量候选：candidates 数组共存同一实例；兼容旧的单元候选（candidate/candidateDir）形态。
+  const candidates: ProbeCandidate[] = Array.isArray(opts.candidates) && opts.candidates.length > 0
+    ? opts.candidates
+    : (opts.candidate ? [{ name: opts.candidate, dir: opts.candidateDir ?? '' }] : [])
   const steps: string[] = []
   const defaultReport: RunProbeResult = {
     outcome: 'error', port, healthy: false, rendered: false, culprit: null, bootLogTail: '', elapsedMs: 0, steps, spec: null,
@@ -413,15 +528,18 @@ export async function runProbe(opts: ProbeOptions): Promise<RunProbeResult> {
   // ① 隔离副本 + 干净装配
   let spec: IsolatedProfileSpec
   try {
-    spec = makeIsolatedProfile(opts.profileDir, opts.stateRoot, opts.candidate, opts.candidateDir)
+    spec = makeIsolatedProfile(opts.profileDir, opts.stateRoot, candidates, opts.companions)
     steps.push(`隔离副本就绪: ${spec.dir}`)
+    steps.push(`候选(${spec.candidates.length}): ${spec.candidates.map((c) => c.name).join(', ')}`)
   } catch (error) {
     steps.push(`隔离副本失败: ${String(error)}`)
     return fail('error', `隔离副本构造失败: ${String(error)}`)
   }
 
   const pnpm = resolvePnpmCommand(opts.dshHome)
-  const pnpmRes = runPnpm(['install', '--prefer-offline'], spec.dir, pnpm)
+  // 官方 peer（@deepseek-ai/dsh-* 发行内嵌、registry 拉不到）不 auto-install：.npmrc 之外再压一个 CLI flag
+  // （优先级最高，免疫任何用户/全局 .npmrc 覆盖）。运行时由探针实例内核按 peer 提供者满足。
+  const pnpmRes = runPnpm(['install', '--prefer-offline', '--config.auto-install-peers=false', '--config.strict-peer-dependencies=false'], spec.profileDir, pnpm)
   if (!pnpmRes.ok) {
     steps.push(`依赖装配失败(status=${String(pnpmRes.status)})`)
     rmSync(spec.dir, { recursive: true, force: true })
@@ -437,11 +555,16 @@ export async function runProbe(opts: ProbeOptions): Promise<RunProbeResult> {
     return fail('error', '未在 harness/PATH 找到 dsh 二进制')
   }
   const env: Record<string, string | undefined> = { ...process.env }
-  if (opts.dshHome) env.DSH_HOME = opts.dshHome
+  // 丢弃父内核注入的全部 DSH_* 运行时身份（DSH_SESSION_JSONL / DSH_SESSION_ID / DSH_WEB_URL 等），
+  // 隔离实例不得写回真实会话；home 一并换成隔离副本（profiles 解析只落在副本）。
+  for (const key of Object.keys(env)) {
+    if (key.startsWith('DSH_')) delete env[key]
+  }
+  env.DSH_HOME = spec.homeDir
   const outLog = join(spec.logDir, `server-${++_probeSeq}.out.log`)
   const errLog = join(spec.logDir, `server-${++_probeSeq}.err.log`)
-  const cmdLine = [`${bin}`, 'web', `-p=${port}`]
-  const child = spawnDetached(cmdLine, opts.candidateDir, outLog, errLog)
+  const cmdLine = [`${bin}`, 'web', '--port', String(port)]
+  const child = spawnDetached(cmdLine, spec.profileDir, outLog, errLog, env)
   steps.push(`已启动隔离实例(pid=${child.pid ?? '?'}, port=${port})`)
 
   // ③ 三态判定
@@ -467,7 +590,8 @@ export async function runProbe(opts: ProbeOptions): Promise<RunProbeResult> {
     steps.push(`超时未就绪(${firstWaitSec}s)`)
   }
 
-  killTree(child)
+  const keepAlive = keep && boot === 'ok'
+  if (!keepAlive) killTree(child)
   const bootLogTail = await latestLogTail(spec.logDir, 'server-', 60)
   const culpritText = boot === 'ok' ? '' : `${bootLogTail}\n${readTextRobust(errLog)}`
 
@@ -475,13 +599,18 @@ export async function runProbe(opts: ProbeOptions): Promise<RunProbeResult> {
   let culprit: ProbeReport['culprit'] = null
   if (boot !== 'ok') culprit = diagnose(profilePluginRows(opts.profileDir), culpritText)
 
-  // ⑤ 销毁副本（零残留）
-  rmSync(spec.dir, { recursive: true, force: true })
+  // ⑤ 销毁副本（零残留；keep 模式且判定通过时保留实例与副本供人工浏览）
+  if (!keepAlive) rmSync(spec.dir, { recursive: true, force: true })
 
   if (boot === 'crashed' || boot === 'timeout') {
     const stepsError = boot === 'crashed' ? '启动崩溃：进程提前退出' : '启动挂起：HTTP 未就绪'
     if (boot === 'timeout') steps.push(stepsError)
     return { ...defaultReport, outcome: boot === 'crashed' ? 'crash' : 'hang', healthy, rendered: false, culprit, bootLogTail, error: stepsError, elapsedMs: Date.now() - t0 }
+  }
+  if (keepAlive) {
+    const keptUrl = `http://127.0.0.1:${port}`
+    steps.push(`keep 模式：实例保持运行 ${keptUrl}（pid=${child.pid ?? '?'}）；关闭: taskkill /PID ${child.pid ?? '?'} /T /F；回收副本: 删除 ${spec.dir}`)
+    return { ...defaultReport, outcome: 'pass', healthy, rendered, culprit, bootLogTail, elapsedMs: Date.now() - t0, spec, kept: true, keptPid: child.pid, keptPort: port, keptUrl, keptDir: spec.dir }
   }
   return { ...defaultReport, outcome: 'pass', healthy, rendered, culprit, bootLogTail, elapsedMs: Date.now() - t0, spec }
 }

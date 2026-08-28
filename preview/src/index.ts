@@ -6,7 +6,6 @@
  *   - toggle   ：启停第三方插件（写 profile patch 装配层 + 对运行 entry update({disabled}) 立即热生效）
  *   - tempLoad / tempRemove / promote ：运行时热插拔 + 转真注入
  *   - uninstall：真卸载（移除磁盘包 + 依赖闭包 + 装配登记 + 自持数据）
- *   - diagnostics：按禁做清单扫已装插件副本库的源码规范，产出治理报告（只读）
  *   - refresh  ：重新扫描已安装插件（安装/卸载后可手动刷新）
  *   - folders / move ：自定义文件夹分组管理
  *   - note / rename / scope ：插件备注 / 显示名 / 作用域覆盖
@@ -16,8 +15,6 @@ import { basename, dirname, isAbsolute, join, normalize } from 'node:path'
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { stat } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
-import vm from 'node:vm'
-import { createRequire } from 'node:module'
 import type { Context } from '@deepseek-ai/cordis'
 import {
   SimpleManagerHost,
@@ -28,13 +25,10 @@ import {
   isOfficialSystemDep,
 } from './host.js'
 import { pnpmAdd, pnpmRemove, specPackageName, verifyInstalled } from './pnpm.js'
-import { diagnosePlugin, resolveInstalledDir } from './diagnostics.js'
-import { realCordisGate } from './preflight.js'
-import { clientSmokeTest, detectClientArtifact, detectOfficialPeerDeps, locateClientRoots, smokeErrToString,
-    type ClientSmokeReport } from './smoke.js'
-import { runProbe, describeOutcome, type ProbeOptions, type RunProbeResult } from './probe.js'
+import { detectClientArtifact, detectOfficialPeerDeps, locateClientRoots } from './smoke.js'
+import { runProbe, describeOutcome, type ProbeCandidate, type ProbeOptions, type RunProbeResult } from './probe.js'
 import { evictPackageModuleCaches } from './module-cache.js'
-import { registerAgentTools, type AgentOps, type OpResult, type OpStep, type PreflightDTO, type ProbeDTO, type ReloadClientDTO, type StatusDTO } from './agent-tools.js'
+import { registerAgentTools, type AgentOps, type OpResult, type OpStep, type ProbeDTO, type ReloadClientDTO, type StatusDTO } from './agent-tools.js'
 
 export const name = 'dsh-plugin-simplemanager'
 
@@ -529,54 +523,6 @@ export function apply(ctx: AppContext): void {
           if (action === 'browse' || action === 'refresh') {
             // refresh 时强制重新扫描文件系统；browse 每次都是实时扫描，语义等价。
             return send({ ok: true, ...buildView() })
-          }
-
-          if (action === 'verifyClient') {
-            // 刷新界面前的 client 无头冒烟预检：判定装配契约 + 注入服务门禁（真实 cordis），
-            // 提前发现「热注入没问题、但重载前端就挂/崩」的插件，并给出分步根因。不依赖桌面渲染端是否在跑。
-            const body = await readJsonBody(req)
-            const raw = body.names
-            const names = Array.isArray(raw) ? raw.filter((n): n is string => typeof n === 'string' && n.trim() !== '') : []
-            const profileDir = host?.profileDir ?? undefined
-            let results: ClientSmokeReport[]
-            try {
-              results = await Promise.all(names.map((n) => clientSmokeTest(n, locateClientRoots(n, profileDir, tempInfos.get(n)?.spec), profileDir)))
-            } catch (error) {
-              return send({ ok: false, error: `预检执行异常：${smokeErrToString(error)}` })
-            }
-            return send({ ok: true, results })
-          }
-
-          if (action === 'diagnostics') {
-            // 第三板块「代码规范治理」：按禁做清单扫已装插件副本库，逐条取证 + 运行态信号佐证。只读、零写面。
-            const body = await readJsonBody(req)
-            const raw = body.names
-            const names = Array.isArray(raw) ? raw.filter((n): n is string => typeof n === 'string' && n.trim() !== '') : []
-            const rawFolders = body.folders
-            const folderIds = (Array.isArray(rawFolders) ? rawFolders : []).filter((f): f is string => typeof f === 'string' && f !== '')
-            const profileDir = host?.profileDir ?? ''
-            const bundles = buildCatalog(ctx, host)
-            // 始终以装配表（catalog）为权威全集；请求缺省时诊断全部第三方插件。
-            // 官方/壳组件排除用 resolveScope 判定的 b.scope（与「插件管理分类」「重载预检名单」同一官方口径），
-            // 不再依赖 isOfficialSystemDep——它只认 @deepseek-ai/dsh-* + cordis + schemastery，
-            // 会漏掉不以 dsh- 前缀的 @deepseek-ai 官方包，导致「官方插件混入诊断」（统一判定见 MANIFEST）。
-            // folders 可选过滤：前端「诊断范围」多选文件夹时，只诊断落在所选文件夹内的第三方插件；
-            // 未传 folders(=空数组)则诊断全部第三方。
-            let targets = names
-            if (targets.length === 0) {
-              const thirdBundles = bundles.filter((b) => b.scope === 'third')
-              if (folderIds.length > 0 && host) {
-                const overlay = host.readOverlay()
-                targets = thirdBundles
-                  .filter((b) => folderIds.includes(effectiveFolder(b, overlay)))
-                  .map((b) => b.name)
-              } else {
-                targets = thirdBundles.map((b) => b.name)
-              }
-            }
-            const live = loaderLiveMap(ctx)
-            const report = targets.map((n) => diagnosePlugin(n, profileDir, live.get(n)?.phase ?? null))
-            return send({ ok: true, report })
           }
 
           // 工具管理「列出工具」（默认形态）：扫出全部可见工具，仅按手动拖拽归属 + 自定义工具组卡分组（不做源码归组）。
@@ -1122,6 +1068,35 @@ function buildCatalog(ctx: AppContext, host: SimpleManagerHost): PluginBundle[] 
   return out
 }
 
+/** 探针「全量协同」伴随清单：取当前环境已加载的第三方插件（装配表驱动），排除候选（单名或批量名单）
+ * 与已在 profile 声明的项，其余以可解析的本地物理源（temp 源目录 / profile node_modules）link 进隔离副本，
+ * 一次装配整个环境做兼容探测。 */
+function collectProbeCompanions(ctx: AppContext, host: SimpleManagerHost, profileDir: string, candidate: string | string[]): Array<{ name: string; spec: string }> {
+  const excluded = new Set<string>(Array.isArray(candidate) ? candidate : [candidate])
+  const out: Array<{ name: string; spec: string }> = []
+  if (!profileDir || !existsSync(join(profileDir, 'package.json'))) return out
+  let declared = new Set<string>()
+  try {
+    const pkg = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8')) as { dependencies?: Record<string, string> }
+    declared = new Set(Object.keys(pkg?.dependencies ?? {}))
+  } catch { /* 不可读则视为无已声明项 */ }
+  for (const b of buildCatalog(ctx, host)) {
+    if (b.scope !== 'third' || excluded.has(b.name) || declared.has(b.name)) continue
+    let spec: string | null = null
+    const t = tempInfos.get(b.name)
+    if (t?.spec) {
+      const d = packageSourceDir(t.spec)
+      if (d && existsSync(d)) spec = `link:${d}`
+    }
+    if (!spec) {
+      const nm = join(profileDir, 'node_modules', b.name)
+      if (existsSync(nm)) spec = `link:${nm}`
+    }
+    if (spec) out.push({ name: b.name, spec })
+  }
+  return out
+}
+
 /** 临时闭包：resolve 名 → { entryId, spec（pnpm add 用原始 spec）, installedDeps（本次补装闭包依赖）}。
  * 临时插件随进程消亡、不写 patch，无需落盘；转正（promote）才写 patch 持久化。 */
 const tempInfos = new Map<string, { entryId: string; spec: string; installedDeps: string[]; hotCopy?: string; baseDir?: string }>()
@@ -1444,7 +1419,7 @@ const _runs = new Map<string, StepRun>()
 const probeRender = { booted: false, renderError: false }
 
 /** agent 触发的「刷新渲染进程」请求（前端轮询消费）。nonce 去重、读后清空、TTL 防陈旧。
- * 仅登记「触发」，无任何检测——媒体护栏（预检/门禁）由 agent 自行编排 pm_verifyPreflight 等工具。 */
+ * 仅登记「触发」，无任何检测——插件能否干净启动由 agent 用 pm_probe 真实探针判定。 */
 let pendingReload: { ts: number; nonce: string } | null = null
 /** 刷新信号的有效窗口：agent 登记后前端须在此时间内轮询到，否则视为陈旧丢弃。 */
 const RELOAD_SIGNAL_TTL = 10_000
@@ -2049,7 +2024,24 @@ async function uninstall(ctx: AppContext, host: SimpleManagerHost, name: string,
 function resolveProfileDir(ctx: Context): string {
   const profiles = ctx.get('desktopProfiles') as DesktopProfiles | undefined
   if (profiles?.current?.dir && typeof profiles.current.dir === 'string') return profiles.current.dir
+  // web/CLI 无桌面壳服务：用插件自身安装位置反推所在 profile，避免回退到进程 cwd
+  // （进程 cwd 可能是 pnpm workspace 根，会让 pnpm add 误判「加到 workspace root」而拒绝）。
+  const selfHome = homeProfileDir()
+  if (selfHome) return selfHome
   return process.cwd()
+}
+
+/** 插件被装配在 <profile>/node_modules/<包>/lib 下，从自身 URL 反推其所在 profile 目录。 */
+function homeProfileDir(): string | null {
+  try {
+    const self = fileURLToPath(import.meta.url)
+    const i = self.indexOf('node_modules')
+    if (i <= 0) return null
+    const home = self.slice(0, i).replace(/[\\/]$/, '')
+    return home.length ? home : null
+  } catch {
+    return null
+  }
 }
 
 function readJsonBody(req: any): Promise<Record<string, unknown>> {
@@ -2071,7 +2063,7 @@ function readJsonBody(req: any): Promise<Record<string, unknown>> {
 /**
  * —— 面向 agent 的执行器（v6）——
  * 在 apply 闭包内构造，封装现有热插拔闭环（tempLoad/tempRemove/promote/uninstall）与只读体检
- * （status/verifyPreflight/diagnose），供 agent-tools.ts 的 defineTool 薄装配。无 tools 宿主静默不注册。
+ * （status），供 agent-tools.ts 的 defineTool 薄装配。无 tools 宿主静默不注册。
  *
  * 每个变更操作都先 beginPlan 建 run 再调底层函数，返回时统一收敛为 OpResult（逐步结果 + 终态 +
  * 是否残留），并把该 run 从内存清走（agent 一次性会话，不留无人消费的 run 快照）。
@@ -2131,7 +2123,7 @@ function makeAgentOps(ctx: AppContext, host: SimpleManagerHost): AgentOps {
       hotLoadable,
       reason,
       depCount: info?.installedDeps.length ?? 0,
-      // status 是同步快照，守卫未命中的具体服务名不在此详查：agent 需要时跑 pm_verifyPreflight。
+      // status 是同步快照，守卫未命中的具体服务名不在此详查：agent 需要时用 pm_probe 真实探针实测。
       pendingServices: [],
       cleanupable: scope === 'third' && !!bundle && !isTemp && !persistent,
       entryId: live?.entryId ?? info?.entryId ?? null,
@@ -2215,55 +2207,84 @@ function makeAgentOps(ctx: AppContext, host: SimpleManagerHost): AgentOps {
     return { ok: !hasErr, action: 'uninstall', packageName, outcome: hasErr ? 'fail' : 'pass', steps, residue: hasErr, error: errNote }
   }
 
-  const verifyPreflight = async (specs: string[]): Promise<PreflightDTO[]> => {
-    const profileDir = host?.profileDir ?? undefined
-    return Promise.all(specs.filter((s) => s.trim() !== '').map(async (s) => {
-      // 入参可能是路径/file:/裸包名：先解析成真实包名（像 tempLoad 那样），打破「先装才有名」的鸡生蛋
-      const n = specPackageName(s.trim(), profileDir)
-      // B3：热装前的本地源预检须以源目录为候选根探测 client——此前只查 profile node_modules（热装前为空）
-      // 导致「未声明 client」空跑漏检本地 UI。源目录存在则优先视其为准，否则回落既有定位（nm + 已热装的 temp 源）。
-      const srcDir = packageSourceDir(s.trim())
-      const roots = srcDir && existsSync(srcDir)
-        ? locateClientRoots(n, profileDir, srcDir)
-        : locateClientRoots(n, profileDir, tempInfos.get(n)?.spec)
-      const r = await clientSmokeTest(n, roots, profileDir)
-      return {
-        name: n,
-        ok: r.ok,
-        outcome: r.outcome,
-        steps: r.steps.map((s) => ({ name: s.name, ok: s.ok, detail: s.detail })),
-        error: r.error,
-      }
-    }))
-  }
-
   const reloadClient = (): ReloadClientDTO => {
     const nonce = Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
     pendingReload = { ts: Date.now(), nonce }
     return { ok: true, nonce, note: '已登记刷新渲染进程请求；面板可见时前端轮询到即重载（仅刷新渲染进程，不重启内核，会话与热装状态保留，零检测）' }
   }
 
-  const probe = async (name: string): Promise<ProbeDTO> => {
-    const profileDir = host?.profileDir ?? ''
-    // 候选插件物理源目录：优先已热装的 temp 源/入参源，否则 profile node_modules。
-    const spec = tempInfos.get(name)?.spec
-    const srcDir = spec ? packageSourceDir(spec) : join(profileDir, 'node_modules', name)
-    if (!srcDir || !existsSync(srcDir)) {
-      return { ok: false, name, outcome: 'error', rendered: false, steps: [], summary: `候选插件源目录不存在: ${srcDir ?? name}`, error: '候选插件源目录不存在', elapsedMs: 0 }
+  const probeProfileDir = host?.profileDir ?? ''
+  const resolveProbeCandidate = (name: string | undefined, spec?: string): { candidateName: string; srcDir: string | undefined } => {
+    // 候选源：显式 spec（本地路径/file:/link:/registry 包名）优先——probe 不依赖 tempLoad 登记；
+    // 未传 spec 时按包名回落：已热装 temp 源 → profile node_modules。
+    let candidateName = typeof name === 'string' ? name.trim() : ''
+    let srcDir: string | undefined
+    if (typeof spec === 'string' && spec.trim() !== '') {
+      const s = spec.trim()
+      candidateName = specPackageName(s, probeProfileDir) ?? candidateName
+      srcDir = packageSourceDir(s) ?? (candidateName ? join(probeProfileDir, 'node_modules', candidateName) : undefined)
+    } else {
+      const tempSpec = tempInfos.get(candidateName)?.spec
+      srcDir = tempSpec ? packageSourceDir(tempSpec) : (candidateName ? join(probeProfileDir, 'node_modules', candidateName) : undefined)
     }
-    const r = await runProbe({ candidate: name, candidateDir: srcDir, profileDir, stateRoot: host.dataDir })
-    return {
-      ok: r.outcome === 'pass',
-      name,
-      outcome: r.outcome,
-      rendered: r.rendered,
-      culprit: r.culprit ?? undefined,
-      steps: r.steps,
-      summary: describeOutcome(r),
-      error: r.error,
-      elapsedMs: r.elapsedMs,
+    return { candidateName, srcDir }
+  }
+  const probeDto = (r: RunProbeResult, plugins: string[]): ProbeDTO => ({
+    ok: r.outcome === 'pass',
+    plugins,
+    outcome: r.outcome,
+    rendered: r.rendered,
+    culprit: r.culprit ?? undefined,
+    steps: r.steps,
+    summary: describeOutcome(r),
+    error: r.error,
+    elapsedMs: r.elapsedMs,
+    kept: r.kept ?? undefined,
+    keptPid: r.keptPid ?? undefined,
+    keptPort: r.keptPort ?? undefined,
+    keptUrl: r.keptUrl ?? undefined,
+    keptDir: r.keptDir ?? undefined,
+  })
+  // 一组候选共存于同一个隔离实例：一次 pnpm 装配、一个内核、一个 URL——
+  // 探测的是插件间的真实共存效果，而非逐个单点。
+  const probeSet = async (candidates: ProbeCandidate[], keep: boolean): Promise<ProbeDTO> => {
+    const r = await runProbe({
+      candidates,
+      profileDir: probeProfileDir,
+      stateRoot: host.dataDir,
+      companions: collectProbeCompanions(ctx, host, probeProfileDir, candidates.map((c) => c.name)),
+      keep,
+    })
+    return probeDto(r, candidates.map((c) => c.name))
+  }
+  const probe = async (name: string | undefined, keep: boolean, spec?: string): Promise<ProbeDTO> => {
+    const { candidateName, srcDir } = resolveProbeCandidate(name, spec)
+    if (!candidateName || !srcDir || !existsSync(srcDir)) {
+      return { ok: false, plugins: candidateName ? [candidateName] : [], outcome: 'error', rendered: false, steps: [], summary: `候选插件源目录不存在: ${srcDir ?? (candidateName || '(未提供 name/spec)')}`, error: '候选插件源目录不存在', elapsedMs: 0 }
     }
+    return await probeSet([{ name: candidateName, dir: srcDir }], keep)
+  }
+  // 批量探针：specs 全部共存于同一个隔离实例。解析失败的 spec 单独列入 unresolved 不拖垮其余；
+  // 同名去重（先到先得）。
+  const probeMany = async (specs: string[], keep: boolean): Promise<ProbeDTO> => {
+    const t0 = Date.now()
+    const list = (Array.isArray(specs) ? specs : []).map((s) => (typeof s === 'string' ? s.trim() : '')).filter((s) => s !== '')
+    if (list.length === 0)
+      return { ok: false, plugins: [], unresolved: [], action: 'probe-batch', outcome: 'error', rendered: false, steps: [], summary: 'specs 为空', elapsedMs: 0 }
+    const resolved: ProbeCandidate[] = []
+    const unresolved: Array<{ spec: string; name?: string; reason: string }> = []
+    for (const s of list) {
+      const { candidateName, srcDir } = resolveProbeCandidate(undefined, s)
+      if (candidateName && srcDir && existsSync(srcDir) && !resolved.some((c) => c.name === candidateName))
+        resolved.push({ name: candidateName, dir: srcDir })
+      else
+        unresolved.push({ spec: s, name: candidateName || undefined, reason: !candidateName ? '无法解析包名' : (!srcDir || !existsSync(srcDir)) ? '源目录不存在' : '与候选列表重复' })
+    }
+    if (resolved.length === 0)
+      return { ok: false, plugins: [], unresolved, action: 'probe-batch', outcome: 'error', rendered: false, steps: [], summary: '无有效候选', elapsedMs: Date.now() - t0 }
+    const r = await probeSet(resolved, keep)
+    return { ...r, unresolved: unresolved.length > 0 ? unresolved : undefined }
   }
 
-  return { status, tempLoad: tempLoadOps, tempRemove: tempRemoveOps, promote: promoteOps, uninstall: uninstallOps, verifyPreflight, reloadClient, probe }
+  return { status, tempLoad: tempLoadOps, tempRemove: tempRemoveOps, promote: promoteOps, uninstall: uninstallOps, reloadClient, probe, probeMany }
 }

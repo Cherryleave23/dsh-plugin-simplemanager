@@ -1,8 +1,8 @@
 # 插件管家（dsh-plugin-simplemanager）
 
-> 适配内核：DSH `0.1.1-rc.2` ｜ 插件包版本：`0.1.1-rc.2-v5`
+> 适配内核：DSH `0.1.2-alpha.1` ｜ 插件包版本：`0.1.2-alpha.1-v1`
 
-> **0.1.1-rc.2-v5 本版变更**：新增「工具管理」面板——把所有注入给 agent 的工具统一管起来：默认**扫出全部工具**（未分组），点「扫描分组」增强按钮自动按插件管理的文件夹层级归档到所属插件卡；可**逐工具 / 整卡开关**控制是否注入（关闭后该工具描述不再注入 agent 的 system prompt，省 token）；支持自定义工具组卡、查看工具描述与参数、拖拽改归属。
+> **0.1.2-alpha.1-v1 本版变更**：适配 DSH 内核 `0.1.2-alpha.1`（大规模架构重组）——仅一项 client 配置迁移：客户端注入从已移除的 `@deepseek-ai/dsh-client-runtime` 迁到承接包 `@deepseek-ai/dsh-client-ui-renderer`（`ctx.slots` 服务名保留）。其余破坏项（`ctx.api` 移除、`CallId→ToolCallId`、`code-dispatch-log→ptc-dispatch-log` 等）消费面零命中，无需代码迁移。功能特性不变。
 
 插件管家是 DSH 桌面壳内的一个**插件管理服务**，把「哪些第三方插件已安装、当前是否在运行、属于哪个分类、有没有备注、内核有没有新版本」统一到一个管理面板里。
 
