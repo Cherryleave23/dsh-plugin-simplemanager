@@ -1,6 +1,0 @@
-# 同名作为 bundle patch 被 `dsh plugin add` 安装：作为官方 profile 层应用。
-# 行配置可被 profile 自己的 cordis.patch.yml 按 id 覆盖（官方规则：profile 层最后应用）。
-- insert:
-    - id: dsh-plugin-simplemanager
-      name: 'dsh-plugin-simplemanager'
-      config: {}
