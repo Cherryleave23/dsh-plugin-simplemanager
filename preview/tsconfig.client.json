@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2024", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "noEmit": true,
+    "types": []
+  },
+  "include": ["src/client.tsx", "src/client-rows.tsx", "src/client-styles.ts", "src/shims.d.ts"]
+}
