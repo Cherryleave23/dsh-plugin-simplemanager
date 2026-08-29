@@ -289,10 +289,19 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   const [toolCatFolder, setToolCatFolder] = useState('')
   /** 工具管理：新建「工具管理文件夹」（scope='tool'，仅工具管理可见）输入框内容。 */
   const [toolFolderDraft, setToolFolderDraft] = useState('')
+  /** 工具管理：左侧分组栏当前选中的条目 id（'__unassigned'=未分组卡；'__freecats'=独立工具组卡片；否则=文件夹 id）。
+   * 选中「未分组」由 loadToolView(false) 的平铺视图承载；镜像插件管理页的左侧文件夹导航形态。 */
+  const [toolActive, setToolActive] = useState('__unassigned')
+  /** 工具管理：左侧分组栏是否展开「新建文件夹」输入（scope='tool'）。 */
+  const [toolFolderCreating, setToolFolderCreating] = useState(false)
   /** 工具管理：扫描分组选卡面板是否打开（需求3：先勾选插件卡→再点确定→只扫这些插件）。 */
   const [scanPickOpen, setScanPickOpen] = useState(false)
   /** 工具管理：扫描选卡面板中已勾选的插件包名集合。 */
   const [scanPickSel, setScanPickSel] = useState<Set<string>>(new Set())
+  /** 工具管理：拖拽中的工具卡 {key,kind}，用于「拖卡进左侧文件夹」；与插件管理拖拽同一 dragName/dragKind 语义。 */
+  const draggingCardRef = useRef<{ key: string; kind: 'plugin' | 'toolcat' } | null>(null)
+  /** 工具管理：拖拽工具卡悬停在左侧文件夹行时的落点高亮 id（空=无）。 */
+  const [toolSideHover, setToolSideHover] = useState('')
   /** 统一确认弹窗（dsh 客户端风格卡片）：替代浏览器原生 confirm，支持可选「同时清除缓存」开关。 */
   const [ask, setAsk] = useState<AskReq | null>(null)
   const [askClearData, setAskClearData] = useState(false)
@@ -485,17 +494,38 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     }
   }
 
-  /** 工具管理（需求3）：扫描分组 = 先打开选卡面板勾选插件卡，再「确定」只扫这些插件。
-   * 全不勾选 = 扫描全部第三方插件。 */
-  const doScan = async (): Promise<void> => {
-    if (scanPickOpen) {
-      const selected = [...scanPickSel]
-      setScanPickOpen(false)
-      await loadToolView(true, { plugins: selected })
-    } else {
-      setScanPickSel(new Set(plugins.filter((p) => p.scope === 'third').map((p) => p.name)))
-      setScanPickOpen(true)
-    }
+  /** 工具管理：点「扫描分组」进入就地选卡模式——下方已有的插件卡可直接点选（不再额外生成一排选卡面板）。
+   * 默认预勾选全部第三方插件卡；点击卡片切换；全不勾选 = 扫描全部第三方插件。 */
+  const doScan = (): void => {
+    setScanPickSel(new Set(plugins.filter((p) => p.scope === 'third').map((p) => p.name)))
+    setScanPickOpen(true)
+    // 就地选卡要盯着「第三方插件」下的插件卡点选，镜像形态下默认停在未分组页看不到卡，先切过去。
+    setToolActive('third')
+  }
+
+  /** 工具管理（就地选卡）：切换某插件卡的勾选态。 */
+  const toggleScanPick = (name: string): void => {
+    setScanPickSel((prev) => {
+      if (prev.has(name)) {
+        const next = new Set(prev)
+        next.delete(name)
+        return next
+      }
+      return new Set(prev).add(name)
+    })
+  }
+
+  /** 工具管理（就地选卡）：确认扫描选中插件（仅选中集合；全不勾选=空数组=扫全部第三方）。 */
+  const confirmScan = async (): Promise<void> => {
+    const selected = [...scanPickSel]
+    setScanPickOpen(false)
+    await loadToolView(true, { plugins: selected })
+  }
+
+  /** 工具管理（就地选卡）：取消退出选卡模式，不改动任何归属。 */
+  const cancelScan = (): void => {
+    setScanPickOpen(false)
+    setScanPickSel(new Set())
   }
 
   /** 新建「工具管理文件夹」（scope='tool'）：仅工具管理可见；用它与插件管理共享文件夹区分作用域。 */
@@ -682,11 +712,11 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
       <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 4 }}>
         {shown.map((t) => (
           <div key={t.name} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} draggable onDragStart={() => setDraggedTool(t.name)} onDragEnd={() => setDraggedTool('')}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} draggable onDragStart={(e) => { e.stopPropagation(); setDraggedTool(t.name) }} onDragEnd={(e) => { e.stopPropagation(); setDraggedTool('') }}>
               <button
                 role="switch"
                 aria-checked={t.enabled}
-                onClick={() => void toggleTool(t.name, !t.enabled)}
+                onClick={(e) => { e.stopPropagation(); void toggleTool(t.name, !t.enabled) }}
                 style={t.enabled ? s.toolSwitchTrackOn : s.toolSwitchTrackOff}
               >
                 <span style={t.enabled ? s.toolSwitchKnobOn : s.toolSwitchKnobOff} />
@@ -694,7 +724,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
               <span
                 style={{ fontSize: 12, fontFamily: 'var(--ds-font-family-code)', color: 'var(--dsw-alias-label-primary)', cursor: 'pointer', userSelect: 'none' }}
                 title={t.description || t.name}
-                onClick={() => setExpandedToolDetail(expandedToolDetail === t.name ? '' : t.name)}
+                onClick={(e) => { e.stopPropagation(); setExpandedToolDetail(expandedToolDetail === t.name ? '' : t.name) }}
               >
                 {t.name}
               </span>
@@ -724,35 +754,46 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     )
   }
 
-  /** 工具管理：统一卡片（plugin / toolcat / unassigned）渲染。拖拽落点=卡片；整卡点击展开/收起。 */
+  /** 工具管理：统一卡片（plugin / toolcat / unassigned）渲染。拖拽落点=卡片；整卡点击展开/收起。
+   * scanSel 非空且 active 时进入「就地选卡」态：点击插件卡切换勾选而非展开，选中卡高亮变色。 */
   const renderToolCard = (
     cardKey: string,
     cardKind: 'plugin' | 'toolcat' | 'unassigned',
     tools: ToolMeta[],
     title: string,
     accent: 'plugin' | 'toolcat' | 'unassigned',
-    opts: { saveTitle?: (t: string) => void; editing: boolean; enterEdit?: () => void; note?: string; removable?: boolean },
+    opts: { saveTitle?: (t: string) => void; editing: boolean; enterEdit?: () => void; note?: string; removable?: boolean; scanSel?: { active: boolean; selected: boolean; onToggle: () => void } },
   ) => {
     const open = expandedToolCard === cardKey
+    const scan = opts.scanSel
+    const selected = !!(scan?.active && scan.selected)
     const disabledCount = tools.filter((t) => !t.enabled).length
     const allOn = disabledCount === 0
     const allOff = disabledCount === tools.length
     const masterNext = allOn ? false : true
-    const accentColor = accent === 'plugin'
-      ? 'var(--dsw-alias-state-business-primary)'
-      : accent === 'toolcat'
-        ? 'var(--dsw-alias-state-warning-primary)'
-        : 'var(--dsw-alias-border-l2)'
+    const accentColor = selected
+      ? 'var(--dsw-alias-state-success-primary)'
+      : accent === 'plugin'
+        ? 'var(--dsw-alias-state-business-primary)'
+        : accent === 'toolcat'
+          ? 'var(--dsw-alias-state-warning-primary)'
+          : 'var(--dsw-alias-border-l2)'
     return (
       <div
         key={cardKey}
         style={{
           ...s.diagCard,
+          ...(selected ? s.toolCardSelected : {}),
           borderLeft: `3px solid ${accentColor}`,
           cursor: 'pointer',
-          outline: toolHoverKey === cardKey ? `2px solid ${accentColor}` : 'none',
+          outline: selected
+            ? `2px solid var(--dsw-alias-state-success-primary)`
+            : (toolHoverKey === cardKey ? `2px solid ${accentColor}` : 'none'),
         }}
-        onClick={() => setExpandedToolCard(open ? '' : cardKey)}
+        onClick={() => { if (scan?.active) { scan.onToggle(); return } setExpandedToolCard(open ? '' : cardKey) }}
+        draggable={cardKind !== 'unassigned' && !(scan?.active)}
+        onDragStart={(e) => { if (cardKind !== 'unassigned' && !scan?.active) { e.stopPropagation(); draggingCardRef.current = { key: cardKey, kind: cardKind }; setToolSideHover('') } }}
+        onDragEnd={() => { draggingCardRef.current = null; setToolSideHover('') }}
         onDragOver={(e) => { e.preventDefault(); if (draggedTool) setToolHoverKey(cardKey) }}
         onDragLeave={() => setToolHoverKey((h) => (h === cardKey ? '' : h))}
         onDrop={() => { if (draggedTool) { setToolHoverKey(''); void setToolGroup(draggedTool, cardKind === 'unassigned' ? '' : cardKey) } }}
@@ -781,6 +822,7 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
           ) : (
             <span style={s.diagCardName}>{title}</span>
           )}
+          {selected && <span style={s.toolCardCheck}>{'✓ 已选'}</span>}
           <span style={s.diagCardBadge}>{`${tools.length} 个工具`}</span>
           {disabledCount > 0 && <span style={{ ...s.diagCardBadge, color: 'var(--dsw-alias-state-danger-primary)' }}>{`${disabledCount} 个已禁`}</span>}
           {opts.removable && (
@@ -813,7 +855,6 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
 
   /** 工具管理：按插件管理的文件夹把插件卡分组（复用同一套文件夹结构，排布一致）。只在有卡时显示对应文件夹。 */
   const toolFolderOptions = folders.filter((f) => f.scope === 'tool')
-  const folderNameOf = (fid: string): string => folderOf(folders, fid)?.name ?? fid
   const pluginFolderBuckets = useMemo(() => {
     // 复用插件管理的文件夹结构：共享文件夹（official/third/shared，位移在插件管理中改、此处同步）在前，
     // 工具管理文件夹（scope='tool'，仅工具栏可见）在后。每个文件夹承载：插件卡（插件管理同源，按 effectiveFolder）
@@ -1142,6 +1183,12 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
     if (pluginName) void call('move', { id: pluginName, folder })
   }
 
+  /** 工具管理：拖拽工具组卡进文件夹（folder=''=移出到「工具组卡片」区），重载当前视图。 */
+  const moveToolCat = async (id: string, folder: string): Promise<void> => {
+    const ok = await call('moveToolCat', { id, folder })
+    if (ok) void loadToolView(toolScanned)
+  }
+
   /** 插件卡片拖拽重排：在 active 文件夹内把 dragged 插入到 target 之前（before）/之后（after），整体提交。 */
   const reorderPluginDrop = (dragged: string, target: string, phase: 'before' | 'after'): void => {
     const from = activePlugins.findIndex((p) => p.name === dragged)
@@ -1203,6 +1250,60 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
   }
 
   if (!ready) return <div style={s.center}>{'加载中…'}</div>
+
+  // 工具管理（镜像插件管理页形态）：左侧分组栏选中条目对应的标题与计数。
+  const toolActiveBucket = toolActive === '__unassigned' || toolActive === '__freecats'
+    ? undefined
+    : pluginFolderBuckets.find((fb) => fb.id === toolActive)
+  const freeToolCats = toolView?.toolCats.filter((c) => !c.folder) ?? []
+  const toolCatTools = (id: string): ToolMeta[] =>
+    (toolView?.cards.find((x) => x.kind === 'toolcat' && x.key === id)?.tools) ?? []
+  const activeToolTitle =
+    toolActive === '__unassigned' ? '未分组 / 未知工具'
+      : toolActive === '__freecats' ? '工具组卡片'
+        : toolActiveBucket?.name ?? '工具分组'
+  const activeToolCount =
+    toolActive === '__unassigned' ? (toolView?.unassigned?.length ?? 0)
+      : toolActive === '__freecats' ? freeToolCats.length
+        : toolActiveBucket ? toolActiveBucket.pluginCards.length + toolActiveBucket.toolCats.length : 0
+
+  /** 工具管理左侧分组栏的行（镜像插件管理页文件夹行）。dropId 非空=可接受卡牌拖入：
+   * 插件卡 → 移动到该文件夹（move）；工具组卡 → moveToolCat 归入；'__freecats' 仅收工具组卡（移出到「工具组卡片」区）。 */
+  const sideRow = (id: string, name: string, count: number, active: boolean, onClick: () => void, opts?: { deletable?: boolean; onDelete?: () => void; dropId?: string }): JSX.Element => {
+    const di = opts?.dropId
+    const dropHover = !!di && toolSideHover === di
+    const rowStyle = active ? { ...s.folder, ...s.folderActive } : s.folder
+    return (
+      <div
+        key={id}
+        style={dropHover ? { ...rowStyle, ...s.folderDragOver } : rowStyle}
+        onClick={onClick}
+        onDragOver={(e) => { if (!di || !draggingCardRef.current) return; e.preventDefault(); setToolSideHover(di) }}
+        onDragLeave={() => setToolSideHover((h) => (di && h === di ? '' : h))}
+        onDrop={(e) => {
+          e.preventDefault()
+          e.stopPropagation()
+          const c = draggingCardRef.current
+          draggingCardRef.current = null
+          setToolSideHover('')
+          if (!c || !di) return
+          if (di === '__freecats') { if (c.kind === 'toolcat') void moveToolCat(c.key, '') }
+          else if (c.kind === 'toolcat') void moveToolCat(c.key, di)
+          else if (c.kind === 'plugin') move(c.key, di)
+        }}
+      >
+        <span style={s.folderName}>{name}</span>
+        {opts?.deletable && opts?.onDelete && (
+          <button
+            style={{ ...s.toolCatActionDanger, height: 20, padding: '0 6px', border: 'none' }}
+            title="删除文件夹"
+            onClick={(e) => { e.stopPropagation(); opts.onDelete!() }}
+          >{'⌫'}</button>
+        )}
+        <span style={s.folderCount}>{count}</span>
+      </div>
+    )
+  }
 
   return (
     <div style={s.root}>
@@ -1447,140 +1548,161 @@ function SimpleManagerTab(_props: Record<string, unknown>): JSX.Element | null {
       )}
 
       {tab === 'toolmanage' && (
-        <div style={s.diagnosePanel}>
-          <div style={s.diagHead}>
-            <input
-              style={s.toolSearchInput}
-              placeholder="搜索工具名 / 描述 / 插件名 / 别名 / 备注…"
-              value={toolQuery}
-              onChange={(e) => setToolQuery(e.target.value)}
-            />
-            <button style={s.diagRunBtn} onClick={() => void (toolScanned ? loadToolView(false) : doScan())} disabled={toolScanBusy}>
-              {toolScanBusy ? '加载中…' : (toolScanned ? '⛁ 回到未分组' : '⛁ 扫描分组')}
-            </button>
-          </div>
+        <div style={s.body}>
+          <aside style={s.sidebar}>
+            <div style={s.sidebarTitle}>
+              <span>{'工具分组'}</span>
+              <button style={s.iconBtn} title="新建工具管理文件夹（仅本页可见）" onClick={() => { setToolFolderDraft(''); setToolFolderCreating((v) => !v) }}>{'+'}</button>
+            </div>
+            {toolFolderCreating && (
+              <div style={s.createBox}>
+                <input
+                  style={s.input}
+                  autoFocus
+                  value={toolFolderDraft}
+                  placeholder="文件夹名"
+                  onChange={(e) => setToolFolderDraft(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') { setToolFolderCreating(false); void createToolFolder() } }}
+                />
+                <button style={s.primaryBtn} onClick={() => { setToolFolderCreating(false); void createToolFolder() }}>{'确定'}</button>
+              </div>
+            )}
 
-          <div style={s.diagList}>
+            {/* 镜像插件管理页形态：左侧分组栏选中一组，右侧展示该组卡片集合 */}
+            {/* __unassigned 只看聚合卡，不让卡片拖入 */}
+            {sideRow('__unassigned', '未分组 / 未知工具', toolView?.unassigned?.length ?? 0, toolActive === '__unassigned', () => setToolActive('__unassigned'))}
+            {pluginFolderBuckets.map((fb) => sideRow(
+              fb.id,
+              fb.name,
+              fb.pluginCards.length + fb.toolCats.length,
+              toolActive === fb.id,
+              () => setToolActive(fb.id),
+              { deletable: fb.scope === 'tool', onDelete: fb.scope === 'tool' ? () => { void deleteFolder({ id: fb.id, name: fb.name, kind: 'custom', scope: 'tool', count: 0 }); setToolActive('__freecats') } : undefined, dropId: fb.id },
+            ))}
+            {/* __freecats 接受工具组卡拖入=移出文件夹回到独立区 */}
+            {sideRow('__freecats', '工具组卡片', freeToolCats.length, toolActive === '__freecats', () => setToolActive('__freecats'), { dropId: '__freecats' })}
+          </aside>
+
+          <section style={s.cards}>
+            {/* 最上面一排：扫描工具单独一行，留白干净（不再混在标题/搜索里） */}
+            <div style={s.scanStrip}>
+              {scanPickOpen ? (
+                <>
+                  <span style={s.cardsCount}>{`已选 ${scanPickSel.size} 张插件卡 · 全不勾选即扫全部`}</span>
+                  <span style={{ flex: 1 }} />
+                  <button style={s.ghostBtnSm} onClick={cancelScan}>{'取消'}</button>
+                  <button style={s.scanConfirmBtn} onClick={() => void confirmScan()} disabled={toolScanBusy}>
+                    {toolScanBusy ? '扫描中…' : `确定扫描${scanPickSel.size ? ` (${scanPickSel.size})` : '全部'}`}
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button style={s.scanBtn} onClick={() => void (toolScanned ? (setToolActive('__unassigned'), loadToolView(false)) : doScan())} disabled={toolScanBusy}>
+                    {toolScanBusy ? '加载中…' : (toolScanned ? '⛁ 回到未分组' : '⛁ 扫描分组')}
+                  </button>
+                  <span style={s.scanStripHint}>
+                    {toolScanned
+                      ? '已按插件归档：拖任意卡片到左侧文件夹可移动；拖工具行可在卡间调整归属'
+                      : '扫描后按插件把内置工具归档到对应插件卡；也可直接拖卡片到左侧文件夹手动归类'}
+                  </span>
+                </>
+              )}
+            </div>
+
+            {/* 卡片区：只留计数，文件夹名由左侧分组栏指示 */}
+            <div style={s.cardsHeader}>
+              <span style={s.cardsCount}>{`${activeToolCount} 张卡`}</span>
+            </div>
+
             {toolView === null ? (
-              <div style={s.diagEmpty}>{'加载工具列表…'}</div>
+              <div style={s.empty}>{'加载工具列表…'}</div>
             ) : (
               <>
-                {/* 扫描选卡面板（需求3）：先勾选要扫描的插件卡，再「确定」只扫这些插件 */}
                 {scanPickOpen && (
-                  <div style={s.toolCatCreateRow}>
-                    <span style={s.toolSectionTitle}>{'选择要扫描的插件卡'}</span>
-                    <span style={s.toolSectionCount}>{'（再点「确定」只扫勾选项；全不勾选=扫全部第三方）'}</span>
-                    <button style={s.toolCatAction} onClick={() => { setScanPickOpen(false); setScanPickSel(new Set()) }}>{'取消'}</button>
+                  <div style={s.toolScanHint}>
+                    <span>{'选择要扫描的插件卡：点击下方插件卡可勾选/取消，全不勾选即扫描全部第三方插件。'}</span>
                   </div>
                 )}
-                {scanPickOpen && (
-                  <div style={s.toolFolderPickBox}>
-                    {plugins.filter((p) => p.scope === 'third').map((p) => {
-                      const key = p.name
-                      const checked = scanPickSel.has(key)
-                      return renderToolCard(`pick:${key}`, 'unassigned', [], displayAliasPl(key), 'unassigned', {
-                        editing: false,
-                        note: (checked ? '☑ 已选' : '☐ 未选') + (p.folder ? ` · 位于「${folderNameOf(p.folder)}」` : ''),
-                      })
+
+                {toolActive === '__unassigned' && (
+                  <div style={s.grid}>
+                    {renderToolCard('__unassigned', 'unassigned', toolView.unassigned, '未分组 / 未知工具', 'unassigned', {
+                      editing: false,
+                      note: toolScanned ? '源码无法判定的工厂动态名 / 外壳打包来源不明工具' : '默认形态：未手动归属的工具都在此；点「扫描分组」按插件归档',
                     })}
                   </div>
                 )}
 
-                {/* 未分组 / 未知工具：默认大聚合卡，收纳所有未归属工具，也是拖拽回未分组的落点。 */}
-                {renderToolCard('__unassigned', 'unassigned', toolView.unassigned, '未分组 / 未知工具', 'unassigned', {
-                  editing: false,
-                  note: toolScanned ? '源码无法判定的工厂动态名 / 外壳打包来源不明工具' : '默认形态：未手动归属的工具都在此；点「扫描分组」按插件归档',
-                })}
-
-                {/* 工具管理文件夹（scope='tool'，仅工具栏可见）新建 */}
-                <div style={s.toolCatCreateRow}>
-                  <span style={s.toolSectionTitle}>{'工具管理文件夹'}</span>
-                  <span style={s.toolSectionCount}>{'仅此页可见，可装插件卡与工具组卡'}</span>
-                  <input
-                    style={s.toolCatDraftInput}
-                    placeholder="新建工具管理文件夹名…"
-                    value={toolFolderDraft}
-                    onChange={(e) => setToolFolderDraft(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === 'Enter') void createToolFolder() }}
-                  />
-                  <button style={s.diagRunBtn} onClick={() => void createToolFolder()} disabled={!toolFolderDraft.trim()}>{'+ 新建'}</button>
-                </div>
-
-                {/* 文件夹分组：复用插件管理文件夹（allowed shared/tool）+ 工具管理文件夹 */}
-                {pluginFolderBuckets.map((fb) => (
-                  <div key={fb.id}>
-                    <div style={s.toolSectionHeader}>
-                      <span style={s.toolSectionTitle}>{fb.name}</span>
-                      <span style={s.toolSectionCount}>
-                        {`${fb.pluginCards.length} 插件卡${fb.toolCats.length ? ` · ${fb.toolCats.length} 工具组卡` : ''}`}
-                        {fb.id === 'third' && !fb.pluginCards.length ? ' · 将已装第三方插件卡拖入左侧文件夹归位' : ''}
-                        {fb.scope === 'tool' ? ' · 仅本页可见' : ''}
-                      </span>
-                      {/* 工具管理文件夹（scope='tool'，仅本页可见）：提供改名/删除（共享文件夹改名/删除在插件管理左侧做） */}
-                      {fb.scope === 'tool' && (
-                        <span style={s.toolCatRowActions}>
-                          <button style={s.toolCatAction} onClick={() => { const n = window.prompt('重命名文件夹', fb.name); if (n && n.trim()) void renameFolder({ id: fb.id, name: fb.name, kind: 'custom', scope: 'tool', count: 0 }, n.trim()) }}>{'改名'}</button>
-                          <button style={s.toolCatActionDanger} onClick={() => void deleteFolder({ id: fb.id, name: fb.name, kind: 'custom', scope: 'tool', count: 0 })}>{'删除'}</button>
-                        </span>
-                      )}
+                {toolActive === '__freecats' && (
+                  <>
+                    <div style={s.toolCatCreateRow}>
+                      <input style={s.toolCatDraftInput} placeholder="新建工具组卡名称…" value={toolCatDraft} onChange={(e) => setToolCatDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void addToolCat(toolCatDraft, '') }} />
+                      <button style={s.diagRunBtn} onClick={() => void addToolCat(toolCatDraft, '')} disabled={!toolCatDraft.trim()}>{'+ 新建工具组卡'}</button>
                     </div>
-                    {fb.pluginCards.map((c) => {
-                      const pl = pluginObjOf(c.key)
-                      return renderToolCard(c.key, 'plugin', c.tools, displayAliasPl(c.key), 'plugin', {
-                        editing: toolAliasEdit === c.key,
-                        saveTitle: (t) => void saveToolAlias(c.key, t),
-                        enterEdit: () => setToolAliasEdit(c.key),
-                        note: pl?.note?.trim() || '',
-                      })
-                    })}
-                    {fb.scope === 'tool' && fb.toolCats.map((c) => (
-                      renderToolCard(c.id, 'toolcat', (toolView.cards.find((x) => x.kind === 'toolcat' && x.key === c.id)?.tools) ?? [], toolCardTitle(c.id), 'toolcat', {
-                        editing: toolCatEdit === c.id,
-                        saveTitle: (t) => void renameToolCat(c.id, t),
-                        enterEdit: () => setToolCatEdit(c.id),
-                        removable: true,
-                        note: '工具组卡：拖工具进来做快捷分组',
-                      })
-                    ))}
-                  </div>
-                ))}
+                    {freeToolCats.length === 0 ? (
+                      <div style={s.empty}>{'暂无独立工具组卡。上方输入框可新建；也可在左侧选中某工具文件夹后在其内新建并归入。'}</div>
+                    ) : (
+                      <div style={s.grid}>
+                        {freeToolCats.map((c) => renderToolCard(c.id, 'toolcat', toolCatTools(c.id), toolCardTitle(c.id), 'toolcat', {
+                          editing: toolCatEdit === c.id,
+                          saveTitle: (t) => void renameToolCat(c.id, t),
+                          enterEdit: () => setToolCatEdit(c.id),
+                          removable: true,
+                          note: '独立工具组卡：拖工具进来做快捷分组',
+                        }))}
+                      </div>
+                    )}
+                  </>
+                )}
 
-                {/* 工具组卡片（未归任何 tool 文件夹）：固定在工具栏底部，拖入工具组卡可移动归属 */}
-                <div style={s.toolSectionHeader}>
-                  <span style={s.toolSectionTitle}>{'工具组卡片'}</span>
-                  <span style={s.toolSectionCount}>{`${toolView.toolCats.filter((c) => !c.folder).length} 张 · 拖入「工具管理文件夹」可归入`}</span>
-                </div>
-                <div style={s.toolCatCreateRow}>
-                  <input
-                    style={s.toolCatDraftInput}
-                    placeholder="新建工具组卡名称…"
-                    value={toolCatDraft}
-                    onChange={(e) => setToolCatDraft(e.target.value)}
-                    onKeyDown={(e) => { if (e.key === 'Enter') void addToolCat(toolCatDraft, toolCatFolder) }}
-                  />
-                  <select
-                    style={s.toolSearchInput}
-                    value={toolCatFolder}
-                    onChange={(e) => setToolCatFolder(e.target.value)}
-                    title="可选择归入某个工具管理文件夹"
-                  >
-                    <option value="">（不归入文件夹）</option>
-                    {toolFolderOptions.map((o) => <option key={o.id} value={o.id}>{o.name}</option>)}
-                  </select>
-                  <button style={s.diagRunBtn} onClick={() => void addToolCat(toolCatDraft, toolCatFolder)} disabled={!toolCatDraft.trim()}>{'+ 新建工具组卡'}</button>
-                </div>
-                {toolView.toolCats.filter((c) => !c.folder).map((c) => (
-                  renderToolCard(c.id, 'toolcat', (toolView.cards.find((x) => x.kind === 'toolcat' && x.key === c.id)?.tools) ?? [], toolCardTitle(c.id), 'toolcat', {
-                    editing: toolCatEdit === c.id,
-                    saveTitle: (t) => void renameToolCat(c.id, t),
-                    enterEdit: () => setToolCatEdit(c.id),
-                    removable: true,
-                    note: '独立工具组卡：拖工具进来做快捷分组',
-                  })
-                ))}
+                {toolActiveBucket ? (
+                  <>
+                    {toolActiveBucket.scope === 'tool' && (
+                      <div style={s.toolSectionHeader}>
+                        <span style={s.toolSectionTitle}>{toolActiveBucket.name}</span>
+                        <span style={s.toolSectionCount}>{'仅本页可见 · 可新建/改名/删除'}</span>
+                        <span style={s.toolCatRowActions}>
+                          <button style={s.toolCatAction} onClick={() => { const n = window.prompt('重命名文件夹', toolActiveBucket.name); if (n && n.trim()) void renameFolder({ id: toolActiveBucket.id, name: toolActiveBucket.name, kind: 'custom', scope: 'tool', count: 0 }, n.trim()) }}>{'改名'}</button>
+                          <button style={s.toolCatActionDanger} onClick={() => { setToolActive('__freecats'); void deleteFolder({ id: toolActiveBucket.id, name: toolActiveBucket.name, kind: 'custom', scope: 'tool', count: 0 }) }}>{'删除'}</button>
+                        </span>
+                      </div>
+                    )}
+                    <div style={s.toolCatCreateRow}>
+                      <input style={s.toolCatDraftInput} placeholder={`新建工具组卡（归入「${toolActiveBucket.name}」）…`} value={toolCatDraft} onChange={(e) => setToolCatDraft(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void addToolCat(toolCatDraft, toolActiveBucket.id) }} />
+                      <button style={s.diagRunBtn} onClick={() => void addToolCat(toolCatDraft, toolActiveBucket.id)} disabled={!toolCatDraft.trim()}>{'+ 新建'}</button>
+                    </div>
+                    {toolActiveBucket.pluginCards.length === 0 && toolActiveBucket.toolCats.length === 0 ? (
+                      <div style={s.empty}>
+                        {toolActiveBucket.scope === 'tool'
+                          ? '此工具管理文件夹暂空。上方输入框可新建工具组卡归入；或从「未分组」把工具卡拖进来。'
+                          : `${toolActiveBucket.name} 暂无工具卡片。若插件在运行，可在上方点「扫描分组」把工具按插件归档到这里。`}
+                      </div>
+                    ) : (
+                      <div style={s.grid}>
+                        {toolActiveBucket.pluginCards.map((c) => {
+                          const pl = pluginObjOf(c.key)
+                          return renderToolCard(c.key, 'plugin', c.tools, displayAliasPl(c.key), 'plugin', {
+                            editing: toolAliasEdit === c.key,
+                            saveTitle: (t) => void saveToolAlias(c.key, t),
+                            enterEdit: () => setToolAliasEdit(c.key),
+                            note: pl?.note?.trim() || '',
+                            scanSel: scanPickOpen ? { active: true, selected: scanPickSel.has(c.key), onToggle: () => toggleScanPick(c.key) } : undefined,
+                          })
+                        })}
+                        {toolActiveBucket.toolCats.map((c) => renderToolCard(c.id, 'toolcat', toolCatTools(c.id), toolCardTitle(c.id), 'toolcat', {
+                          editing: toolCatEdit === c.id,
+                          saveTitle: (t) => void renameToolCat(c.id, t),
+                          enterEdit: () => setToolCatEdit(c.id),
+                          removable: true,
+                          note: '工具组卡：拖工具进来做快捷分组',
+                        }))}
+                      </div>
+                    )}
+                  </>
+                ) : null}
               </>
             )}
-          </div>
+          </section>
         </div>
       )}
 

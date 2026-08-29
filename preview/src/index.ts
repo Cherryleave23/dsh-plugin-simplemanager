@@ -540,13 +540,13 @@ export function apply(ctx: AppContext): void {
             const selected: string[] = Array.isArray(body.plugins)
               ? body.plugins.filter((x: unknown): x is string => typeof x === 'string')
               : []
-            const v = buildToolView(ctx, host, { scan: true, onlyPlugins: selected.length ? selected : undefined })
+            const v = buildToolView(ctx, host, { scan: true, onlyPlugins: selected.length ? selected : undefined, persistScan: true })
             return send({ ok: true, toolCats: v.toolCats, cards: v.cards, unassigned: v.unassigned })
           }
 
           // 工具管理「自定义工具组卡」增删改（工具管理特有，不进入插件管理页）。folder 参数（可选）：
           // 把该卡归入某个工具管理文件夹（scope='tool'）下；缺省不归入任何文件夹。
-          if (action === 'addToolCat' || action === 'renameToolCat' || action === 'removeToolCat') {
+          if (action === 'addToolCat' || action === 'renameToolCat' || action === 'removeToolCat' || action === 'moveToolCat') {
             const body = await readJsonBody(req)
             const ov = host.readOverlay()
             const cats = { ...(ov.toolCats ?? {}) }
@@ -569,8 +569,17 @@ export function apply(ctx: AppContext): void {
               return send({ ok: true, id, name, folder: cats[id].folder ?? '' })
             }
             // removeToolCat：删除卡片，并把曾归属到它的工具引用清空（回未分组）。
+            // moveToolCat：把已有工具组卡移动到某「工具管理文件夹」（scope='tool'），folder='' = 移出到「工具组卡片」区。
             const id = typeof body.id === 'string' ? body.id : ''
             if (!id || !cats[id]) return fail('工具组卡不存在')
+            if (action === 'moveToolCat') {
+              const folder = typeof body.folder === 'string' && (body.folder === '' || (ov.folders[body.folder] && ov.folders[body.folder].scope === 'tool'))
+                ? body.folder
+                : ''
+              cats[id] = folder ? { ...cats[id], folder } : { name: cats[id].name }
+              host.writeOverlay({ ...ov, toolCats: cats })
+              return send({ ok: true, id, folder: cats[id].folder ?? '' })
+            }
             delete cats[id]
             const overrides = { ...(ov.toolGroupOverrides ?? {}) }
             for (const [tool, key] of Object.entries(overrides)) {
@@ -1072,7 +1081,11 @@ function buildCatalog(ctx: AppContext, host: SimpleManagerHost): PluginBundle[] 
  * 与已在 profile 声明的项，其余以可解析的本地物理源（temp 源目录 / profile node_modules）link 进隔离副本，
  * 一次装配整个环境做兼容探测。 */
 function collectProbeCompanions(ctx: AppContext, host: SimpleManagerHost, profileDir: string, candidate: string | string[]): Array<{ name: string; spec: string }> {
-  const excluded = new Set<string>(Array.isArray(candidate) ? candidate : [candidate])
+  const excludedRaw = Array.isArray(candidate) ? candidate : [candidate]
+  const excluded = new Set<string>(excludedRaw)
+  // 热装换键副本（<name>-hotN）与候选是同一逻辑插件：排除时按「去 -hotN 后缀」比较，
+  // 否则探针会把候选自己的旧码副本当伴随 link 进隔离实例（其产物注册 id 仍是逻辑名，混装冲突）。
+  const isExcluded = (name: string): boolean => excluded.has(name) || excluded.has(name.replace(/-hot\d+$/, ''))
   const out: Array<{ name: string; spec: string }> = []
   if (!profileDir || !existsSync(join(profileDir, 'package.json'))) return out
   let declared = new Set<string>()
@@ -1081,7 +1094,7 @@ function collectProbeCompanions(ctx: AppContext, host: SimpleManagerHost, profil
     declared = new Set(Object.keys(pkg?.dependencies ?? {}))
   } catch { /* 不可读则视为无已声明项 */ }
   for (const b of buildCatalog(ctx, host)) {
-    if (b.scope !== 'third' || excluded.has(b.name) || declared.has(b.name)) continue
+    if (b.scope !== 'third' || isExcluded(b.name) || declared.has(b.name)) continue
     let spec: string | null = null
     const t = tempInfos.get(b.name)
     if (t?.spec) {
@@ -1152,12 +1165,13 @@ function describeTool(def: Record<string, unknown>): { description: string; para
  *   工具只按用户手动拖拽的 toolGroupOverrides 归属进卡片；未归属工具全部进 unassigned（「未分组/未知」大聚合卡）。
  * - scan=true（增强 scanToolGroups）：额外对第三方插件做源码注册扫描，把可判定的工具自动归到对应插件卡。
  *   onlyPlugins（可选）= 只扫这些插件（前端「勾选卡片再确定」），缺省扫全部第三方。手动拖拽归属优先于扫描。
+ *   persistScan（可选）= 扫描完成后把本次归属并入 toolGroupOverrides 并清理失效旧记录，使「扫过一次后刷新/重启分组仍在」。
  * 返回 toolCats + 卡片(cards: 常驻 plugin/toolcat) + unassigned。归属 key 校验：仅当是已知插件或有同名自定义卡才有效，
  * 否则该工具回未分组（避免悬空引用）。 */
 function buildToolView(
   ctx: AppContext,
   host: SimpleManagerHost,
-  opts: { scan: boolean; onlyPlugins?: string[] },
+  opts: { scan: boolean; onlyPlugins?: string[]; persistScan?: boolean },
 ): {
   toolCats: Array<{ id: string; name: string; folder?: string }>
   cards: Array<{ kind: 'plugin' | 'toolcat'; key: string; tools: ToolMeta[] }>
@@ -1189,14 +1203,30 @@ function buildToolView(
     const scanTargets = opts.onlyPlugins && opts.onlyPlugins.length
       ? third.filter((b) => opts.onlyPlugins!.includes(b.name))
       : third
+    const scanAssigned = new Map<string, string>()
     for (const b of scanTargets) {
       const pkgDir = profileDir ? join(profileDir, 'node_modules', b.name) : ''
       if (!pkgDir) continue
       let found: string[] = []
       try { if (existsSync(pkgDir)) found = scanToolNamesInPackage(pkgDir) } catch { found = [] }
       for (const n of found) {
-        if (liveNames.has(n) && !assigned.has(n)) assigned.set(n, b.name)
+        if (liveNames.has(n) && !assigned.has(n)) {
+          assigned.set(n, b.name)
+          scanAssigned.set(n, b.name)
+        }
       }
+    }
+    // 持久化扫描归属：把本次扫描打到的归属并入 toolGroupOverrides 并清理失效旧记录（工具已不存在 / 归属卡已消失），
+    // 使「扫过一次后刷新/重启分组仍在」，也与 buildToolView 顶部对 toolGroupOverrides 的清理语义保持一致。
+    if (opts.persistScan && (scanAssigned.size > 0 || Object.keys(overrides).length > 0)) {
+      const ov = host.readOverlay()
+      const merged = { ...overrides }
+      for (const [n, key] of scanAssigned) merged[n] = key
+      for (const t of Object.keys(merged)) {
+        if (!liveNames.has(t)) delete merged[t]
+        else if (merged[t] && !cats[merged[t]] && !pluginNameSet.has(merged[t])) delete merged[t]
+      }
+      host.writeOverlay({ ...ov, toolGroupOverrides: merged })
     }
   }
   // 2) 组装卡片：第三方插件卡常驻（即使暂无工具，按插件管理文件夹排布由前端叠加）+ 自定义工具组卡常驻。
@@ -2028,6 +2058,12 @@ function resolveProfileDir(ctx: Context): string {
   // （进程 cwd 可能是 pnpm workspace 根，会让 pnpm add 误判「加到 workspace root」而拒绝）。
   const selfHome = homeProfileDir()
   if (selfHome) return selfHome
+  // 补充：`link:` 装配时（profile 的 package.json 里 dependencies 用 link: 指向插件源码目录，
+  // 如 `"dsh-plugin-simplemanager": "link:D:/.../preview"`），Node 会把 import.meta.url 解析成
+  // 源码真实路径、里面不含 node_modules，homeProfileDir 必然落空。此时扫描 DSH 家目录下所有
+  // profile，找「node_modules/<本插件名> 的符号链接真实指向 == 本插件真实包根」的那个 profile。
+  const linkedHome = linkedProfileDir()
+  if (linkedHome) return linkedHome
   return process.cwd()
 }
 
@@ -2039,6 +2075,38 @@ function homeProfileDir(): string | null {
     if (i <= 0) return null
     const home = self.slice(0, i).replace(/[\\/]$/, '')
     return home.length ? home : null
+  } catch {
+    return null
+  }
+}
+
+/** `link:` 装配反推：找到把本插件以符号链接装进自己 node_modules 的那个 profile 目录。 */
+function linkedProfileDir(): string | null {
+  try {
+    const self = fileURLToPath(import.meta.url)
+    // 本插件真实包根：从 lib/<entry>.js 向上走到第一个含 package.json 的目录。
+    let root = dirname(self)
+    while (root && root !== dirname(root) && !existsSync(join(root, 'package.json'))) root = dirname(root)
+    if (!root || !existsSync(join(root, 'package.json'))) return null
+    const selfRoot = realpathSync(root)
+    const selfName = (JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as { name?: string }).name
+    if (typeof selfName !== 'string' || selfName === '') return null
+    const home = process.env.DSH_HOME || join(process.env.HOME || process.env.USERPROFILE || '.', '.dsh')
+    const profilesRoot = join(home, 'profiles')
+    if (!existsSync(profilesRoot)) return null
+    const same = (a: string, b: string): boolean =>
+      process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b
+    for (const entry of readdirSync(profilesRoot, { withFileTypes: true })) {
+      if (!entry.isDirectory()) continue
+      const nm = join(profilesRoot, entry.name, 'node_modules', selfName)
+      if (!existsSync(nm)) continue
+      try {
+        if (same(realpathSync(nm), selfRoot)) return join(profilesRoot, entry.name)
+      } catch {
+        // 坏链接/权限异常：跳过该 profile 继续扫描
+      }
+    }
+    return null
   } catch {
     return null
   }

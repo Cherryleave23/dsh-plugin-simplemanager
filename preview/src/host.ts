@@ -223,7 +223,7 @@ export class SimpleManagerHost {
     const out: PluginBundle[] = []
     const seen = new Set<string>()
     const overrides = this.readConfig().scopeOverrides
-    const runtimeRoot = runtimeNodeModules()
+    const runtimeRoot = runtimeNodeModules(this.profileDir)
 
     if (runtimeRoot) {
       const officialDir = join(runtimeRoot, '@deepseek-ai')
@@ -289,11 +289,11 @@ export class SimpleManagerHost {
    * 装配表是权威的插件全集，但可能含目录扫描没覆盖的包（如桌面壳顶层第三方 dshmarket），
    * 元数据由这里按名补齐；查不到返回 null。
    */
-  describeBundle(name: string): { version: string; description: string; source: PluginBundle['source']; dependencies: string[] } | null {
+  describeBundle(name: string, profileDir: string = this.profileDir): { version: string; description: string; source: PluginBundle['source']; dependencies: string[] } | null {
     const locations: Array<[string, PluginBundle['source']]> = [
-      [join(this.profileDir, 'node_modules', name, 'package.json'), 'profile'],
+      [join(profileDir, 'node_modules', name, 'package.json'), 'profile'],
     ]
-    const rr = runtimeNodeModules()
+    const rr = runtimeNodeModules(profileDir)
     if (rr) locations.push([join(rr, name, 'package.json'), 'runtime'])
     for (const [pkg, source] of locations) {
       if (!existsSync(pkg)) continue
@@ -494,24 +494,15 @@ export function isOfficialSystemDep(name: string): boolean {
   )
 }
 
-/** 桌面壳/客户端运行时产物识别：这些归"壳/third"，不算官方内核插件。启发式名单，可被 scopeOverrides 覆盖。 */
+/**
+ * 桌面壳判定：纯官方策略下**恒 false**——已抛弃 desktop、转为纯官方（dsh web/CLI）发行后，
+ * `@deepseek-ai/*` 下挂的内核与客户端包（含 `dsh-web-app`、`dsh-client-*`、`dsh-shell-env`、
+ * `dsh-app-boot` 等）本就是官方产品的一部分，应全部归为 `official`，不得再按旧的桌面壳名单
+ * 误判成 `shell`（第三文件夹）。保留函数签名供外部引用与 scopeOverrides 边界覆盖。
+ */
 export function isShellName(name: string): boolean {
-  if (!name.startsWith('@deepseek-ai/')) return false
-  const n = name.slice('@deepseek-ai/'.length)
-  return (
-    n === 'dsh-shell' ||
-    n === 'dsh-shell-env' ||
-    n === 'dsh-app-boot' ||
-    n === 'dsh-cordis-client-runner' ||
-    n === 'dsh-cordis-host-runner' ||
-    n === 'dsh-launch-environment' ||
-    n === 'dsh-host-frontend-static' ||
-    n === 'dsh-host-plugin-inventory' ||
-    n === 'dsh-web' ||
-    n === 'dsh-web-app' ||
-    n === 'dsh-web-frontend' ||
-    n.startsWith('dsh-client-')
-  )
+  void name
+  return false
 }
 
 export function resolveScope(name: string, overrides: Record<string, PluginScope>): PluginScope {
@@ -529,8 +520,37 @@ export function effectiveFolder(bundle: Pick<PluginBundle, 'name' | 'scope'>, ov
   return overlay.assignments[bundle.name] ?? defaultFolderFor(bundle.scope)
 }
 
-/** 运行时官方内核 node_modules 根（Desktop 为 resources/app.asar.unpacked/node_modules）。 */
-function runtimeNodeModules(): string | null {
+/** 运行时官方内核 node_modules 根（Desktop 为 resources/app.asar.unpacked/node_modules；
+ * 纯官方 web/CLI 为按名解析 @deepseek-ai/dsh 所在的内核 node_modules）。
+ * 解析失败（既非 desktop 也没有可解析内核）返回 null。 */
+function runtimeNodeModules(profileDir: string = ''): string | null {
+  // 1) 从 profile 目录沿 node_modules 链上溯，找到含内核 @deepseek-ai/dsh 的共享运行时根。
+  //    纯官方的 pnpm workspace 把全部运行时刻包 hoisted 到 profile 上一层的 node_modules（如
+  //    ~/.dsh/profiles/node_modules），profile 自身 node_modules 只有少数字面依赖。
+  //    不能靠 require.resolve 反推：它会把 workspace junction realpath 到源码 monorepo（如
+  //    harness/apps/cli），上溯三层得到的是仓库根而非运行时 node_modules，会扫不到任何官方包。
+  if (profileDir) {
+    let p = profileDir
+    for (;;) {
+      const nm = join(p, 'node_modules')
+      if (existsSync(join(nm, '@deepseek-ai', 'dsh', 'package.json'))) return nm
+      const up = dirname(p)
+      if (up === p) break
+      p = up
+    }
+  }
+  // 2) 按名解析内核包派生 node_modules 根（用于上方上溯失败的场景；仅当解析链本就含内核时可靠，
+  //    避免撞上开发仓库源码 workspace 得到错误根）。
+  try {
+    const spec = rawResolve(KERNEL_SPEC, profileDir)
+    if (spec) {
+      const nm = dirname(dirname(dirname(spec)))
+      if (existsSync(join(nm, '@deepseek-ai', 'dsh'))) return nm
+    }
+  } catch {
+    /* 走 desktop 候选 */
+  }
+  // 3) desktop 候选，兼容旧发行。
   const candidates: string[] = []
   const resourcesPath = (process as { resourcesPath?: string }).resourcesPath
   if (typeof resourcesPath === 'string' && resourcesPath) {

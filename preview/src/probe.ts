@@ -14,7 +14,7 @@
  *   - 独立状态根 + 独立端口/环境(DSH_HOME override)，不与运行中桌面内核冲突；
  *   - 结束必杀进程树(taskkill /T /F) + 删副本，保证零残留。
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, lstatSync, readlinkSync, createWriteStream } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, readdirSync, lstatSync, readlinkSync, symlinkSync, createWriteStream } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
 import { createServer } from 'node:net'
@@ -266,6 +266,16 @@ export function makeIsolatedProfile(
   const profileDir = join(homeDir, 'profiles', 'web')
   mkdirSync(profileDir, { recursive: true })
   mkdirSync(logDir, { recursive: true })
+  // 共享运行时可达性:官方 @deepseek-ai/* 由内核运行时闭包提供(真实 home 的
+  // profiles/node_modules 是指向 dsh 内核 apps/cli node_modules 的 junction 投影)。
+  // 探针隔离 home 若缺这条链,loader 会按 baseUrl(隔离 profile)上溯解析、命不中官方包,
+  // ClientModuleRegistry 便定位不到 @deepseek-ai/dsh-client-modules → bootstrap 批次为空 →
+  // 页面报 "HTML did not preload ...client.js"。故在隔离 home 建到真实共享运行时的只读 junction。
+  const sharedModuleRoot = join(dirname(baseProfileDir), 'node_modules')
+  if (existsSync(join(sharedModuleRoot, '@deepseek-ai', 'dsh-client-modules'))) {
+    const probeShared = join(homeDir, 'profiles', 'node_modules')
+    try { symlinkSync(sharedModuleRoot, probeShared, isWin() ? 'junction' : 'dir') } catch { /* 建链失败退化为现状,不阻断 */ }
+  }
 
   // 装配元数据：锁定同源官方依赖 + 全部候选插件(以 file: 指向其源，非 link:，内存判据)。
   const basePkg = JSON.parse(readFileSync(join(baseProfileDir, 'package.json'), 'utf8')) as {
@@ -352,8 +362,13 @@ export function makeIsolatedProfile(
     }
     patchText = kept.join('\n')
   }
-  if (insertAdds.length > 0) {
-    const block = insertAdds.map((e) => `    - id: ${e.id}\n      name: ${e.name}`).join('\n')
+  // insert 行去重：复制的真实补丁里已登记过的 id 不再追加。候选/伴随若此前已 promote 过
+  // （真实补丁里已有其 insert 行），追加会产生重复 loader entry id → cordis:include 启动即崩。
+  const patchIds = new Set<string>()
+  for (const m of patchText.matchAll(/^\s*-?\s*id:\s*['"]?([^'"\n]+?)['"]?\s*$/gm)) patchIds.add(m[1].trim())
+  const pendingInserts = insertAdds.filter((e) => !patchIds.has(e.id) && !patchIds.has(e.name))
+  if (pendingInserts.length > 0) {
+    const block = pendingInserts.map((e) => `    - id: ${e.id}\n      name: ${e.name}`).join('\n')
     if (/\[\]\s*$/.test(patchText)) patchText = patchText.replace(/\[\]\s*$/, `- insert:\n${block}\n`)
     else patchText = patchText.replace(/\s*$/, `\n- insert:\n${block}\n`)
   }
